@@ -1,4 +1,4 @@
-# Codex DeepSeek Team
+# DeepSeek Team
 
 One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to isolated DeepSeek workers. Workers are read-only by default and can opt into source creation/editing inside a clean linked Git worktree.
 
