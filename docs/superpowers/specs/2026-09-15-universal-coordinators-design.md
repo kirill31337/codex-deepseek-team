@@ -8,7 +8,7 @@ Keep one Linux package that lets either Codex or Claude Code coordinate bounded 
 
 - Linux and Python 3.11+ remain the only supported platform in this release.
 - Existing `codex-deepseek-team` commands and Codex behavior remain compatible by default.
-- Add the neutral `deepseek-team` console alias; the Python package and repository name remain unchanged.
+- The neutral repository/primary CLI name is `deepseek-team`; the legacy Python distribution name, import namespace and CLI alias remain for upgrade compatibility.
 - Keep the existing DeepSeek credential location and `CODEX_DEEPSEEK_DISABLED` switch for compatibility; add `DEEPSEEK_TEAM_DISABLED` as the neutral equivalent.
 - Keep the shared three-worker limit, unlimited default deadline, single-attempt writer policy and post-run Git verification.
 
