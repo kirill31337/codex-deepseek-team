@@ -1,6 +1,6 @@
 # Universal package implementation plan
 
-Goal: publish codex-deepseek-team as an installable Python package independent of its source application and the chosen primary Codex model.
+Goal: publish DeepSeek Team as an installable Python package independent of its source application and the chosen primary coordinator. The legacy Python distribution name `codex-deepseek-team` is retained for upgrade compatibility, while the repository and primary CLI are neutral (`deepseek-team`).
 
 Architecture: standard-library Python CLI; existing isolated runner and scoped writer; user-level provider/key setup; managed project instruction block; generic diagnostics. Linux and Python 3.11+ are the initial supported platform.
 
