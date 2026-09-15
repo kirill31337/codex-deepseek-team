@@ -19,7 +19,7 @@ if '--version' in sys.argv:
     print('claude-code fixture')
     sys.exit(0)
 if '--help' in sys.argv:
-    print('--bare --print --output-format --no-session-persistence --permission-mode --tools --allowedTools')
+    print('--bare --print --output-format --no-session-persistence --permission-mode --tools --allowedTools --disallowedTools')
     sys.exit(0)
 root = pathlib.Path(__file__).parent
 prompt = sys.stdin.read()
@@ -29,6 +29,10 @@ record = {
     'cwd': os.getcwd(),
     'home': os.environ.get('HOME'),
     'base_url': os.environ.get('ANTHROPIC_BASE_URL'),
+    'model': os.environ.get('ANTHROPIC_MODEL'),
+    'haiku_model': os.environ.get('ANTHROPIC_DEFAULT_HAIKU_MODEL'),
+    'effort': os.environ.get('CLAUDE_CODE_EFFORT_LEVEL'),
+    'compact_window': os.environ.get('CLAUDE_CODE_AUTO_COMPACT_WINDOW'),
     'auth_digest': hashlib.sha256(os.environ.get('ANTHROPIC_AUTH_TOKEN', '').encode()).hexdigest(),
     'parent_api_key': 'ANTHROPIC_API_KEY' in os.environ,
     'parent_oauth': 'CLAUDE_CODE_OAUTH_TOKEN' in os.environ,
@@ -89,7 +93,14 @@ class ClaudeRuntimeTests(unittest.TestCase):
         self.assertEqual(args[args.index('--output-format') + 1], 'json')
         self.assertEqual(args[args.index('--permission-mode') + 1], 'dontAsk')
         self.assertEqual(args[args.index('--tools') + 1], 'Read,Glob,Grep')
+        self.assertNotIn('--allowedTools', args, 'Bare Read allow would approve reads outside the worktree')
+        self.assertIn('--disallowedTools', args)
+        self.assertEqual(args[args.index('--disallowedTools') + 1], 'mcp__*')
         self.assertEqual(call['base_url'], 'https://api.deepseek.com/anthropic')
+        self.assertEqual(call['model'], 'deepseek-flash[1m]')
+        self.assertEqual(call['haiku_model'], 'deepseek-flash')
+        self.assertEqual(call['effort'], 'max')
+        self.assertEqual(call['compact_window'], '786432')
         self.assertEqual(call['auth_digest'], hashlib.sha256(self.key.encode()).hexdigest())
         self.assertFalse(call['parent_api_key'])
         self.assertFalse(call['parent_oauth'])
@@ -99,16 +110,27 @@ class ClaudeRuntimeTests(unittest.TestCase):
         self.assertFalse(Path(call['home']).exists())
         self.assertNotIn('inspect only', args)
 
-    def test_claude_writer_exposes_only_file_tools(self):
-        args = worker.command('claude', ['src/value.py'], runtime='claude')
+    def test_claude_writer_exposes_only_file_tools_and_exact_edit_permissions(self):
+        args = worker.command('claude', ['src/value.py', 'tests/test_value.py'], runtime='claude')
         tools = args[args.index('--tools') + 1]
-        allowed = args[args.index('--allowedTools') + 1]
         self.assertEqual(tools, 'Read,Glob,Grep,Edit,Write')
-        self.assertEqual(allowed, tools)
+        start = args.index('--allowedTools') + 1
+        end = args.index('--disallowedTools')
+        self.assertEqual(args[start:end], ['Edit(./src/value.py)', 'Edit(./tests/test_value.py)'])
+        self.assertNotIn('Read', args[start:end])
+        self.assertNotIn('Edit', args[start:end])
+        self.assertEqual(args[end + 1], 'mcp__*')
         self.assertNotIn('Bash', tools)
         self.assertNotIn('WebFetch', tools)
         self.assertNotIn('WebSearch', tools)
+        self.assertNotIn('Agent', tools)
         self.assertIn('Allowed files:', ' '.join(args))
+
+    def test_claude_writer_rejects_paths_that_cannot_be_safely_encoded_as_permission_rules(self):
+        for path in ['src/a(b).py', 'src/a)b.py']:
+            with self.subTest(path=path), self.assertRaises(worker.WorkerError) as caught:
+                worker.command('claude', [path], runtime='claude')
+            self.assertEqual(caught.exception.code, 78)
 
     def test_claude_runtime_does_not_require_codex_provider_config(self):
         self.assertFalse(Path(self.env['CODEX_HOME']).exists())
