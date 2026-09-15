@@ -25,9 +25,9 @@ class UniversalCliTests(unittest.TestCase):
         codex = self.bin / 'codex'
         codex.write_text('#!/bin/sh\ncase "$1" in\n--version) echo codex-cli-test;;\nexec) echo "--strict-config --ephemeral --json --sandbox --ignore-rules";;\nesac\n')
         codex.chmod(0o755)
-        claude = self.bin / 'claude'
-        claude.write_text('#!/bin/sh\ncase "$1" in\n--version) echo claude-code-test;;\n--help) echo "--bare --print --output-format --no-session-persistence --permission-mode --tools --allowedTools";;\nesac\n')
-        claude.chmod(0o755)
+        self.claude = self.bin / 'claude'
+        self.claude.write_text('#!/bin/sh\ncase "$1" in\n--version) echo claude-code-test;;\n--help) echo "--bare --print --output-format --no-session-persistence --permission-mode --tools --allowedTools --disallowedTools";;\nesac\n')
+        self.claude.chmod(0o755)
         self.env['PATH'] = str(self.bin) + os.pathsep + self.env['PATH']
 
     def cli(self, *args, input=''):
@@ -75,6 +75,13 @@ class UniversalCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('claude-code-test', result.stdout)
         self.assertFalse((self.home / 'codex/config.toml').exists())
+
+    def test_claude_doctor_requires_disallowed_tools_support(self):
+        self.claude.write_text('#!/bin/sh\ncase "$1" in\n--version) echo claude-code-old;;\n--help) echo "--bare --print --output-format --no-session-persistence --permission-mode --tools --allowedTools";;\nesac\n')
+        self.claude.chmod(0o755)
+        result = self.cli('doctor', '--runtime', 'claude', '--offline')
+        self.assertEqual(result.returncode, 78, result.stdout + result.stderr)
+        self.assertIn('required', result.stderr.lower())
 
     def test_neutral_disable_switch_stops_before_runtime_or_credentials(self):
         env = dict(self.env, DEEPSEEK_TEAM_DISABLED='1')
