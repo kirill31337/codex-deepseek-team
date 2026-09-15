@@ -135,7 +135,7 @@ The writer gets one attempt, one owner per file, exact allowed paths, a per-work
 ### Claude Code worker
 
 - Uses DeepSeek's Anthropic-compatible endpoint in a separate Claude Code process.
-- Uses the DeepSeek-recommended `deepseek-flash[1m]` Claude model mapping, max effort and compact window; DeepSeek currently serves V4.1 Flash.
+- Uses DeepSeek's current Claude integration mapping `deepseek-flash[1m]` with max effort; DeepSeek currently serves V4.1 Flash.
 - Runs `--bare`, print mode, JSON output and no session persistence with a temporary HOME.
 - Parent Anthropic API keys/OAuth are not inherited; only the DeepSeek worker token is supplied to the child API client.
 - Built-in tool availability is restricted to `Read,Glob,Grep` for review and `Read,Glob,Grep,Edit,Write` for writer work. Bash, web tools and agents are absent from the tool surface; MCP tools are explicitly denied.
