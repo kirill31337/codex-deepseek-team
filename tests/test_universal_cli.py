@@ -103,6 +103,9 @@ class PackagingTests(unittest.TestCase):
         urls = data['project']['urls']
         self.assertEqual(urls['Repository'], 'https://github.com/kirill31337/deepseek-team')
         self.assertEqual(urls['Issues'], 'https://github.com/kirill31337/deepseek-team/issues')
+        readme = (root / 'README.md').read_text()
+        self.assertIn('git clone https://github.com/kirill31337/deepseek-team.git', readme)
+        self.assertNotIn('github.com/kirill31337/codex-deepseek-team', readme)
 
 
 if __name__ == '__main__':
