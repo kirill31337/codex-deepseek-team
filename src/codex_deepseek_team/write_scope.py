@@ -15,10 +15,21 @@ class ScopeError(Exception):
         self.code, self.message = code, message
 
 
-def git(*args):
-    result = subprocess.run(['git', *args], stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL)
-    if result.returncode:
+def git(*args, input=None, ok=(0,)):
+    # Verification runs outside the model sandbox. Do not inherit repository/index
+    # overrides, credentials or executable filesystem-monitor hooks from the caller.
+    allow = {'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ'}
+    env = {name: value for name, value in os.environ.items() if name in allow}
+    env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_OPTIONAL_LOCKS='0', GIT_TERMINAL_PROMPT='0',
+               GIT_NO_REPLACE_OBJECTS='1')
+    result = subprocess.run(
+        ['git', '-c', 'core.fsmonitor=false', '-c', 'core.filemode=true',
+         '-c', 'core.ignoreStat=false', '-c', 'core.trustctime=true',
+         '-c', 'core.hooksPath=' + os.devnull,
+         '-c', 'core.attributesFile=' + os.devnull, *args],
+        input=input, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if result.returncode not in ok:
         raise ScopeError(78, 'Cannot verify the writer worktree; the coordinator must inspect it.')
     return result.stdout
 
@@ -48,13 +59,58 @@ class WriteScope:
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise ScopeError(78, 'Writer targets must be ordinary files without hard links.')
 
+    def git_pointer(self, code):
+        try:
+            fd = os.open(self.root / '.git', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise OSError('unsafe pointer')
+                pointer = source.read(4097)
+                if len(pointer) > 4096:
+                    raise OSError('oversized pointer')
+                return pointer
+        except OSError:
+            raise ScopeError(code, 'Writer requires an ordinary .git pointer without symbolic or hard links; work retained for inspection.') from None
+
+    def verify_index_flags(self, code):
+        # Git diff deliberately trusts assume-unchanged / skip-worktree entries.
+        # Fail closed instead of clearing flags or silently losing existing work.
+        entries = git('ls-files', '-v', '-z').split(b'\0')
+        if any(entry and not entry.startswith(b'H ') for entry in entries):
+            raise ScopeError(code, 'Writer cannot verify assume-unchanged, skip-worktree or unmerged index entries; use a clean full worktree.')
+
+    def verify_checkout_features(self, code):
+        entries = git('ls-files', '--stage', '-z').split(b'\0')
+        if any(entry.startswith(b'160000 ') for entry in entries):
+            raise ScopeError(code, 'Writer does not support submodule entries; recursive Git checks may execute helpers outside the sandbox.')
+        # Even --name-only / --no-ext-diff can invoke clean/process filters.
+        # Inspect names only, never configured commands (which may contain secrets).
+        configured = git('config', '--null', '--name-only', '--get-regexp',
+                         r'^filter\..*\.(clean|process)$', ok=(0, 1))
+        drivers = {name[7:].rsplit(b'.', 1)[0]
+                   for name in configured.split(b'\0') if name}
+        if not drivers:
+            return
+        paths = [entry.partition(b'\t')[2] for entry in entries if entry]
+        paths.extend(os.fsencode(name) for name in sorted(self.paths))
+        attributes = git('check-attr', '--all', '-z', '--stdin',
+                         input=b'\0'.join(paths) + b'\0').split(b'\0')
+        if attributes[-1] != b'' or (len(attributes) - 1) % 3:
+            raise ScopeError(code, 'Cannot verify Git filter attributes; work retained for inspection.')
+        for index in range(0, len(attributes) - 1, 3):
+            if attributes[index + 1] == b'filter' and attributes[index + 2] in drivers:
+                raise ScopeError(code, 'Writer cannot safely verify configured clean/process filters; use an ordinary source worktree without external filters.')
+
     def changed_paths(self):
         # No exclude-standard: ignored new files are still changes to inspect.
-        raw = git('diff', '--name-only', '--no-renames', '-z', self.head, '--')
+        raw = git('diff', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none',
+                  '--name-only', '--no-renames', '-z', self.head, '--')
         raw += git('ls-files', '--others', '-z')
         return {os.fsdecode(name) for name in raw.split(b'\0') if name}
 
     def __enter__(self):
+        self.pointer = self.git_pointer(78)
         root = Path(os.fsdecode(git('rev-parse', '--show-toplevel')).strip()).resolve()
         git_dir = Path(os.fsdecode(git('rev-parse', '--absolute-git-dir')).strip()).resolve()
         common = Path(os.fsdecode(git('rev-parse', '--git-common-dir')).strip()).resolve()
@@ -72,8 +128,11 @@ class WriteScope:
                 fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise ScopeError(75, 'This worktree already has an active DeepSeek writer.') from None
+            self.verify_index_flags(78)
+            self.verify_checkout_features(78)
             self.head = git('rev-parse', 'HEAD').strip()
-            if self.changed_paths() or git('diff', '--cached', '--name-only', '-z'):
+            if self.changed_paths() or git('diff', '--cached', '--no-ext-diff', '--no-textconv',
+                    '--ignore-submodules=none', '--name-only', '-z'):
                 raise ScopeError(78, 'Writer needs a clean worktree, including untracked and ignored files; existing work is preserved.')
             return self
         except BaseException:
@@ -82,9 +141,14 @@ class WriteScope:
             raise
 
     def verify(self):
+        if self.git_pointer(73) != self.pointer:
+            raise ScopeError(73, 'Writer changed its Git pointer; result rejected, work retained for inspection.')
+        self.verify_index_flags(73)
+        self.verify_checkout_features(73)
         if (git('rev-parse', 'HEAD').strip() != self.head or
                 git('branch', '--show-current').strip() != self.branch or
-                git('diff', '--cached', '--name-only', '-z')):
+                git('diff', '--cached', '--no-ext-diff', '--no-textconv',
+                    '--ignore-submodules=none', '--name-only', '-z')):
             raise ScopeError(73, 'Writer changed Git state; result rejected, work retained for coordinator inspection.')
         if not self.changed_paths() <= self.paths:
             raise ScopeError(73, 'Writer changed files outside its allowlist; result rejected, work retained for coordinator inspection.')

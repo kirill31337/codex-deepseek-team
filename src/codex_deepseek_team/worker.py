@@ -72,7 +72,10 @@ def codex_home():
 def load_api_key():
     """Prefer explicit environment; otherwise read the user's private credential."""
     if 'DEEPSEEK_API_KEY' in os.environ:
-        return os.environ['DEEPSEEK_API_KEY']
+        key = os.environ['DEEPSEEK_API_KEY']
+        if key and (len(key) > 4096 or not re.fullmatch(r'[!-~]+', key)):
+            raise WorkerError(78, 'DEEPSEEK_API_KEY must be a single ASCII value without whitespace, up to 4096 characters; review it locally.')
+        return key
     directory = Path.home() / '.config/codex-deepseek'
     try:
         parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -124,15 +127,39 @@ def redact(value, key):
 
 
 def acquire_slot(state):
-    state.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for number in range(3):
-        fd = os.open(state / f'worker-{number}.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
-        except BlockingIOError:
+    directory, fd = None, None
+    unsafe = ('Worker state requires a private user-owned directory (700) and '
+              'regular lock files (600), without symlinks or hard links.')
+    try:
+        state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        info = os.fstat(directory)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise WorkerError(78, unsafe)
+        for number in range(3):
+            fd = os.open(f'worker-{number}.lock',
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         0o600, dir_fd=directory)
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+                    info.st_uid != os.geteuid() or info.st_mode & 0o077):
+                raise WorkerError(78, unsafe)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                fd = None
+                continue
+            acquired, fd = fd, None
+            return acquired
+        raise WorkerError(75, 'Three DeepSeek workers are already running; the coordinator should continue locally.')
+    except OSError:
+        raise WorkerError(78, unsafe) from None
+    finally:
+        if fd is not None:
             os.close(fd)
-    raise WorkerError(75, 'Three DeepSeek workers are already running; the coordinator should continue locally.')
+        if directory is not None:
+            os.close(directory)
 
 
 def child_environment(home, key):
@@ -203,31 +230,46 @@ def stop_group(process):
 
 
 def execute(args, env, task, timeout):
+    try:
+        payload = task.encode('utf-8')
+    except UnicodeError:
+        raise WorkerError(70, 'Worker task is not valid UTF-8.') from None
+    # Decode only after reaping the process, including the timeout path. Malformed
+    # output must never escape as a traceback or be published as a valid answer.
     process = subprocess.Popen(args, env=env, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, start_new_session=True)
+                               start_new_session=True)
     try:
-        out, err = process.communicate(task, timeout=timeout)
-        return process.returncode if process.returncode >= 0 else 128 - process.returncode, out, err
+        out, err = process.communicate(payload, timeout=timeout)
+        code = process.returncode if process.returncode >= 0 else 128 - process.returncode
     except subprocess.TimeoutExpired:
         stop_group(process)
         out, err = process.communicate()
-        return 124, out, err + '\nDeepSeek worker exceeded its total timeout.\n'
+        code = 124
+        err += b'\nDeepSeek worker exceeded its total timeout.\n'
     except BaseException:
         stop_group(process)
         raise
+    try:
+        return code, out.decode('utf-8'), err.decode('utf-8')
+    except UnicodeError:
+        raise WorkerError(70, 'Codex returned invalid UTF-8 output; no answer was accepted.') from None
 
 
 def result_events(raw):
     messages, errors, completed, failed = [], [], False, False
     for line in raw.splitlines():
+        if not line.strip():
+            continue
         try:
             event = json.loads(line)
-        except ValueError:
-            continue
+        except (ValueError, RecursionError):
+            raise WorkerError(70, 'Codex returned a malformed JSON event stream; no answer was accepted.') from None
         if not isinstance(event, dict):
             raise WorkerError(70, 'Codex returned an invalid event object.')
         kind = event.get('type')
+        if not isinstance(kind, str) or not kind:
+            raise WorkerError(70, 'Codex returned an invalid event type.')
         if kind == 'item.completed':
             item = event.get('item', {})
             if not isinstance(item, dict):
