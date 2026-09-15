@@ -19,6 +19,7 @@ import tomllib
 
 
 MODEL = 'deepseek-flash'
+CLAUDE_MODEL = 'deepseek-flash[1m]'
 CLAUDE_BASE_URL = 'https://api.deepseek.com/anthropic'
 PROVIDER = {
     'name': 'DeepSeek', 'base_url': 'https://api.deepseek.com/',
@@ -178,11 +179,13 @@ def child_environment(home, key, runtime='codex'):
             HOME=str(home),
             ANTHROPIC_BASE_URL=CLAUDE_BASE_URL,
             ANTHROPIC_AUTH_TOKEN=key,
-            ANTHROPIC_MODEL=MODEL,
-            ANTHROPIC_DEFAULT_OPUS_MODEL=MODEL,
-            ANTHROPIC_DEFAULT_SONNET_MODEL=MODEL,
+            ANTHROPIC_MODEL=CLAUDE_MODEL,
+            ANTHROPIC_DEFAULT_OPUS_MODEL=CLAUDE_MODEL,
+            ANTHROPIC_DEFAULT_SONNET_MODEL=CLAUDE_MODEL,
             ANTHROPIC_DEFAULT_HAIKU_MODEL=MODEL,
             CLAUDE_CODE_SUBAGENT_MODEL=MODEL,
+            CLAUDE_CODE_EFFORT_LEVEL='max',
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW='786432',
             DISABLE_TELEMETRY='1',
             DISABLE_ERROR_REPORTING='1',
         )
@@ -236,17 +239,26 @@ def _codex_command(binary, write_paths=()):
     return args + ['-']
 
 
+def _claude_edit_rule(name):
+    if '(' in name or ')' in name:
+        raise WorkerError(78, 'Claude writer paths cannot contain parentheses because they cannot be encoded safely in permission rules.')
+    return f'Edit(./{name})'
+
+
 def _claude_command(binary, write_paths=()):
     tools = 'Read,Glob,Grep,Edit,Write' if write_paths else 'Read,Glob,Grep'
     instructions = WRITE_INSTRUCTIONS if write_paths else INSTRUCTIONS
     if write_paths:
         instructions += '\nAllowed files: ' + json.dumps(list(write_paths))
-    return [
+    args = [
         binary, '--bare', '-p', '--no-session-persistence',
         '--output-format', 'json', '--permission-mode', 'dontAsk',
-        '--tools', tools, '--allowedTools', tools,
-        '--append-system-prompt', instructions,
+        '--tools', tools,
     ]
+    if write_paths:
+        args += ['--allowedTools', *[_claude_edit_rule(name) for name in write_paths]]
+    args += ['--disallowedTools', 'mcp__*', '--append-system-prompt', instructions]
+    return args
 
 
 def command(binary, write_paths=(), runtime='codex'):
