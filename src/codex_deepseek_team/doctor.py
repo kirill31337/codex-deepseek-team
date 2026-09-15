@@ -1,4 +1,4 @@
-"""Generic local diagnostics and optional synthetic DeepSeek smoke test."""
+"""Generic local diagnostics and optional synthetic DeepSeek smoke tests."""
 import argparse
 import hashlib
 import importlib.util
@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,8 +20,8 @@ worker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(worker)
 
 
-def call(task, cwd=None):
-    return subprocess.run([sys.executable, str(HERE / 'worker.py')],
+def call(task, cwd=None, runtime='codex'):
+    return subprocess.run([sys.executable, str(HERE / 'worker.py'), '--runtime', runtime],
                           input=task, text=True, capture_output=True, cwd=cwd)
 
 
@@ -65,8 +66,8 @@ def stream_model(lines):
 
 def api_probe():
     """Runs in a separate, bounded process. Never writes credentials or raw responses."""
-    if os.environ.get('CODEX_DEEPSEEK_DISABLED') == '1':
-        print('API probe: DISABLED — remove CODEX_DEEPSEEK_DISABLED to run live tests.')
+    if os.environ.get('DEEPSEEK_TEAM_DISABLED') == '1' or os.environ.get('CODEX_DEEPSEEK_DISABLED') == '1':
+        print('API probe: DISABLED — remove the DeepSeek delegation disable switch to run live tests.')
         return 69
     key = worker.load_api_key()
     if not key.strip():
@@ -107,13 +108,44 @@ def api_probe():
         return 1
 
 
-def live_tests():
-    if os.environ.get('CODEX_DEEPSEEK_DISABLED') == '1':
-        print('Live check disabled by CODEX_DEEPSEEK_DISABLED.')
+def selected_runtimes(value):
+    if value == 'both':
+        return ('codex', 'claude')
+    if value in ('codex', 'claude'):
+        return (value,)
+    found = tuple(name for name in ('codex', 'claude') if shutil.which(name))
+    if found:
+        return found
+    raise worker.WorkerError(78, 'Neither Codex nor Claude Code is available for --runtime auto.')
+
+
+def check_runtime(runtime):
+    if runtime == 'codex':
+        config = worker.provider_config(worker.codex_home())
+        version = subprocess.check_output(['codex', '--version'], text=True).strip()
+        help_text = subprocess.check_output(['codex', 'exec', '--help'], text=True)
+        required = ['--strict-config', '--ephemeral', '--json', '--sandbox', '--ignore-rules']
+        if not all(flag in help_text for flag in required):
+            raise worker.WorkerError(78, 'Codex CLI lacks required options; update Codex before using workers.')
+        print(version)
+        print('Configured coordinator:', config.get('model', '(Codex default)'), '/', config.get('model_provider', 'openai'))
+        return
+    version = subprocess.check_output(['claude', '--version'], text=True).strip()
+    help_text = subprocess.check_output(['claude', '--help'], text=True)
+    required = ['--bare', '--output-format', '--no-session-persistence', '--permission-mode', '--tools', '--allowedTools']
+    if not all(flag in help_text for flag in required):
+        raise worker.WorkerError(78, 'Claude Code lacks required non-interactive isolation options; update Claude Code before using workers.')
+    print(version)
+    print('Claude Code worker routing: isolated DeepSeek Anthropic-compatible child; parent Claude auth/config untouched.')
+
+
+def live_tests(runtimes=('codex',)):
+    if os.environ.get('DEEPSEEK_TEAM_DISABLED') == '1' or os.environ.get('CODEX_DEEPSEEK_DISABLED') == '1':
+        print('Live check disabled by DeepSeek delegation switch.')
         return 69
     key = worker.load_api_key()
     if not key.strip():
-        print('Live check blocked: set a DeepSeek key with codex-deepseek-team auth set.')
+        print('Live check blocked: set a DeepSeek key with deepseek-team auth set.')
         return 78
     code, out, err = worker.execute(
         [sys.executable, str(Path(__file__).resolve()), '--api-probe'],
@@ -125,51 +157,53 @@ def live_tests():
         return code
     state = Path.home() / '.local/state/codex-deepseek'
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='doctor-', dir=state) as directory:
-        root = Path(directory)
-        subprocess.run(['git', 'init', '-q', str(root)], check=True, capture_output=True)
-        (root / 'evidence.txt').write_text('DEEPSEEK_TEAM_SYNTHETIC_EVIDENCE')
-        before = repository_fingerprint(root)
-        print('Running one read-only worker on synthetic data; no total deadline...', flush=True)
-        result = call('Read only evidence.txt. Return its exact content and DEEPSEEK_TEAM_OK. Do not read other files, run tests, use network or write anything.', cwd=root)
-        ok = (result.returncode == 0 and 'DEEPSEEK_TEAM_SYNTHETIC_EVIDENCE' in result.stdout
-              and 'DEEPSEEK_TEAM_OK' in result.stdout and before == repository_fingerprint(root))
-        print('Synthetic worker check: ' + ('PASS' if ok else 'FAIL'))
-        if not ok:
-            print('Worker failed or returned incomplete evidence; raw output omitted.')
-        return 0 if ok else (result.returncode or 70)
+    for runtime in runtimes:
+        with tempfile.TemporaryDirectory(prefix='doctor-', dir=state) as directory:
+            root = Path(directory)
+            subprocess.run(['git', 'init', '-q', str(root)], check=True, capture_output=True)
+            (root / 'evidence.txt').write_text('DEEPSEEK_TEAM_SYNTHETIC_EVIDENCE')
+            before = repository_fingerprint(root)
+            print(f'Running one {runtime} read-only worker on synthetic data; no total deadline...', flush=True)
+            result = call('Read only evidence.txt. Return its exact content and DEEPSEEK_TEAM_OK. Do not read other files, run tests, use network or write anything.', cwd=root, runtime=runtime)
+            ok = (result.returncode == 0 and 'DEEPSEEK_TEAM_SYNTHETIC_EVIDENCE' in result.stdout
+                  and 'DEEPSEEK_TEAM_OK' in result.stdout and before == repository_fingerprint(root))
+            print(f'Synthetic {runtime} worker check: ' + ('PASS' if ok else 'FAIL'))
+            if not ok:
+                print('Worker failed or returned incomplete evidence; raw output omitted.')
+                return result.returncode or 70
+    return 0
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--offline', action='store_true', help='Local checks only (default); no network or key reads.')
-    group.add_argument('--live', action='store_true', help='Also verify DeepSeek API routing and one synthetic worker; API charges apply.')
+    group.add_argument('--live', action='store_true', help='Also verify DeepSeek API routing and synthetic worker(s); API charges apply.')
+    parser.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='codex',
+                        help='Runtime(s) to verify; default codex preserves legacy behavior.')
     args = parser.parse_args(argv)
     try:
-        config = worker.provider_config(worker.codex_home())
-        version = subprocess.check_output(['codex', '--version'], text=True).strip()
-        help_text = subprocess.check_output(['codex', 'exec', '--help'], text=True)
-        if not all(flag in help_text for flag in ['--strict-config', '--ephemeral', '--json', '--sandbox', '--ignore-rules']):
-            print('Codex CLI lacks required options; update Codex before using workers.')
-            return 78
-        print(version)
-        print('Configured coordinator:', config.get('model', '(Codex default)'), '/', config.get('model_provider', 'openai'))
-        print('Local configuration checks: PASS. Verified CLI release: 0.153.4; live routing is checked separately.')
+        runtimes = selected_runtimes(args.runtime)
+        for runtime in runtimes:
+            check_runtime(runtime)
+        print('Local runtime checks: PASS.')
         if not args.live:
-            print('No network requests or credential validation performed. Use --live for an API check.')
+            print('No network requests or credential validation performed. Use --live for API and worker checks.')
             return 0
-        paths = [worker.codex_home() / 'config.toml', worker.codex_home() / 'auth.json']
+        paths = []
+        if 'codex' in runtimes:
+            paths = [worker.codex_home() / 'config.toml', worker.codex_home() / 'auth.json']
         before = [path.read_bytes() if path.exists() else None for path in paths]
-        code = live_tests()
+        code = live_tests(runtimes)
         unchanged = before == [path.read_bytes() if path.exists() else None for path in paths]
-        print('Primary configuration/auth unchanged:', unchanged)
+        if paths:
+            print('Primary Codex configuration/auth unchanged:', unchanged)
         return code if unchanged else 1
     except worker.WorkerError as error:
         print(error.message, file=sys.stderr)
         return error.code
     except (OSError, subprocess.SubprocessError):
-        print('Diagnostics could not complete; check Codex, Git and local configuration.', file=sys.stderr)
+        print('Diagnostics could not complete; check selected CLI, Git and local configuration.', file=sys.stderr)
         return 78
 
 

@@ -115,10 +115,11 @@ class WriteScope:
         git_dir = Path(os.fsdecode(git('rev-parse', '--absolute-git-dir')).strip()).resolve()
         common = Path(os.fsdecode(git('rev-parse', '--git-common-dir')).strip()).resolve()
         self.branch = git('branch', '--show-current').strip()
+        dedicated = self.branch.startswith(b'codex/') or self.branch.startswith(b'deepseek/')
         if (root != self.root or git_dir == common or
                 git('rev-parse', '--show-superproject-working-tree').strip() or
-                not self.branch.startswith(b'codex/') or not (root / '.git').is_file()):
-            raise ScopeError(78, 'Writer requires the root of a linked worktree on a dedicated codex/ branch.')
+                not dedicated or not (root / '.git').is_file()):
+            raise ScopeError(78, 'Writer requires the root of a linked worktree on a dedicated codex/ or deepseek/ branch.')
         for name in self.paths:
             self.validate_path(name)
         self.lock = os.open(git_dir / 'codex-deepseek-writer.lock',

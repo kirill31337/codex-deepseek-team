@@ -21,17 +21,19 @@ class InstallTests(unittest.TestCase):
 
     def simulate_venv(self, path):
         (path / 'bin').mkdir(parents=True, exist_ok=True)
-        (path / 'bin/codex-deepseek-team').write_text('entrypoint')
+        for command in installer.COMMANDS:
+            (path / 'bin' / command).write_text('entrypoint')
 
-    def test_install_and_repeat_own_only_the_dedicated_entrypoint(self):
+    def test_install_and_repeat_publish_legacy_and_neutral_entrypoints(self):
         with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
                 mock.patch.object(installer.subprocess, 'run') as run:
             self.assertEqual(installer.main(self.args), 0)
             self.assertEqual(installer.main(self.args), 0)
-        command = self.bin / 'codex-deepseek-team'
-        self.assertTrue(command.is_symlink())
-        self.assertEqual(command.resolve(), self.prefix / 'venv/bin/codex-deepseek-team')
-        self.assertEqual({p.name for p in self.bin.iterdir()}, {'codex-deepseek-team'})
+        for command_name in installer.COMMANDS:
+            command = self.bin / command_name
+            self.assertTrue(command.is_symlink())
+            self.assertEqual(command.resolve(), self.prefix / 'venv/bin' / command_name)
+        self.assertEqual({p.name for p in self.bin.iterdir()}, set(installer.COMMANDS))
         self.assertEqual(run.call_count, 2)
 
     def test_foreign_prefix_is_never_modified(self):
@@ -44,12 +46,20 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(list(self.prefix.iterdir()), [marker])
 
     def test_foreign_entrypoint_is_never_overwritten(self):
-        self.bin.mkdir()
-        command = self.bin / 'codex-deepseek-team'
-        command.write_bytes(b'user program')
-        self.assertEqual(installer.main(self.args), 78)
-        self.assertEqual(command.read_bytes(), b'user program')
-        self.assertFalse(self.prefix.exists())
+        for command_name in installer.COMMANDS:
+            with self.subTest(command=command_name):
+                if self.bin.exists():
+                    import shutil
+                    shutil.rmtree(self.bin)
+                if self.prefix.exists():
+                    import shutil
+                    shutil.rmtree(self.prefix)
+                self.bin.mkdir()
+                command = self.bin / command_name
+                command.write_bytes(b'user program')
+                self.assertEqual(installer.main(self.args), 78)
+                self.assertEqual(command.read_bytes(), b'user program')
+                self.assertFalse(self.prefix.exists())
 
     def test_symlink_prefix_is_refused(self):
         other = self.prefix.parent / 'other'
@@ -58,11 +68,12 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(installer.main(self.args), 78)
         self.assertEqual(list(other.iterdir()), [])
 
-    def test_failed_pip_does_not_publish_entrypoint(self):
+    def test_failed_pip_does_not_publish_entrypoints(self):
         with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
                 mock.patch.object(installer.subprocess, 'run', side_effect=installer.subprocess.CalledProcessError(1, 'pip')):
             self.assertEqual(installer.main(self.args), 78)
-        self.assertFalse((self.bin / 'codex-deepseek-team').exists())
+        for command_name in installer.COMMANDS:
+            self.assertFalse((self.bin / command_name).exists())
 
     def test_recovery_from_interrupted_ownership_marker(self):
         self.prefix.mkdir()
@@ -78,12 +89,17 @@ class InstallTests(unittest.TestCase):
                 import shutil
                 shutil.rmtree(self.prefix / 'venv')
 
-    def test_equivalent_prefix_and_relative_command_link_allow_update(self):
+    def test_equivalent_prefix_and_relative_command_links_allow_update(self):
         with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
                 mock.patch.object(installer.subprocess, 'run'):
             self.assertEqual(installer.main(self.args), 0)
-            command = self.bin / 'codex-deepseek-team'
-            command.unlink()
-            command.symlink_to('../package/venv/bin/codex-deepseek-team')
+            for command_name in installer.COMMANDS:
+                command = self.bin / command_name
+                command.unlink()
+                command.symlink_to('../package/venv/bin/' + command_name)
             args = ['--prefix', str(self.prefix / '../package'), '--bin-dir', str(self.bin)]
             self.assertEqual(installer.main(args), 0)
+
+
+if __name__ == '__main__':
+    unittest.main()
