@@ -100,6 +100,9 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(scripts['codex-deepseek-team'], 'codex_deepseek_team.cli:main')
         self.assertEqual(scripts['deepseek-team'], 'codex_deepseek_team.cli:main')
         self.assertEqual(data['project']['version'], '0.2.0')
+        urls = data['project']['urls']
+        self.assertEqual(urls['Repository'], 'https://github.com/kirill31337/deepseek-team')
+        self.assertEqual(urls['Issues'], 'https://github.com/kirill31337/deepseek-team/issues')
 
 
 if __name__ == '__main__':
