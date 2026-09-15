@@ -19,8 +19,8 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/kirill31337/codex-deepseek-team"
-Issues = "https://github.com/kirill31337/codex-deepseek-team/issues"
+Repository = "https://github.com/kirill31337/deepseek-team"
+Issues = "https://github.com/kirill31337/deepseek-team/issues"
 
 [project.scripts]
 codex-deepseek-team = "codex_deepseek_team.cli:main"
