@@ -1,10 +1,8 @@
-"""Idempotent managed block for the codex-deepseek-team project guidance.
+"""Idempotent managed blocks for Codex and Claude Code project guidance.
 
-``attach`` writes delegation guidance into a clearly marked, unique block in the
-repository root ``AGENTS.md``. Every byte outside the owned region is preserved
-verbatim: the module never normalises line endings, never drops user text and
-owns any separator it inserts, so ``attach`` followed by ``detach`` restores the
-pre-existing bytes exactly.
+The module writes delegation guidance into a clearly marked, unique block in the
+coordinator-native root instruction file. Every byte outside the owned region is
+preserved verbatim: line endings are not normalized and user text is not dropped.
 """
 import os
 from pathlib import Path
@@ -19,23 +17,24 @@ START_MARKER = b"<!-- codex-deepseek-team:managed-block:start -->"
 END_MARKER = b"<!-- codex-deepseek-team:managed-block:end -->"
 DATA_FILE = Path(__file__).resolve().parent / "data" / "delegation.md"
 DEFAULT_MODE = 0o644
+TARGETS = {'codex': 'AGENTS.md', 'claude': 'CLAUDE.md'}
 
 
 class ProjectError(Exception):
     """Raised for an invalid or ambiguous target; existing content is untouched."""
 
 
-def _guidance():
+def _guidance(runtime='codex'):
     try:
         body = DATA_FILE.read_bytes()
     except OSError as error:
         raise ProjectError("packaged delegation guidance is unavailable") from error
-    return body.strip(b"\n")
+    return body.replace(b'{runtime}', runtime.encode('ascii')).strip(b"\n")
 
 
-def _block_bytes(state):
+def _block_bytes(state, runtime='codex'):
     metadata = b"<!-- codex-deepseek-team:original:" + state + b" -->\n"
-    return START_MARKER + b"\n" + metadata + _guidance() + b"\n" + END_MARKER + b"\n"
+    return START_MARKER + b"\n" + metadata + _guidance(runtime) + b"\n" + END_MARKER + b"\n"
 
 
 def _repository_root(root):
@@ -64,11 +63,11 @@ def _read_agents(target):
     except FileNotFoundError:
         return None, None
     except OSError as error:
-        raise ProjectError("cannot safely open AGENTS.md; symbolic links are refused") from error
+        raise ProjectError(f"cannot safely open {target.name}; symbolic links are refused") from error
     info = os.fstat(descriptor)
     if not stat.S_ISREG(info.st_mode):
         os.close(descriptor)
-        raise ProjectError("AGENTS.md must be an ordinary file")
+        raise ProjectError(f"{target.name} must be an ordinary file")
     with os.fdopen(descriptor, "rb") as handle:
         return handle.read(), stat.S_IMODE(info.st_mode)
 
@@ -79,11 +78,11 @@ def _locate(content):
     if not starts and not ends:
         return None
     if starts != 1 or ends != 1:
-        raise ProjectError("AGENTS.md has duplicate or unbalanced managed-block markers")
+        raise ProjectError("instruction file has duplicate or unbalanced managed-block markers")
     begin = content.find(START_MARKER)
     finish = content.find(END_MARKER)
     if finish < begin:
-        raise ProjectError("AGENTS.md has out-of-order managed-block markers")
+        raise ProjectError("instruction file has out-of-order managed-block markers")
     return begin, finish
 
 
@@ -110,7 +109,7 @@ def _owned_span(content, begin, finish, state):
 
 def _write_atomic(target, original, mode, content):
     descriptor, temporary = tempfile.mkstemp(
-        dir=os.fspath(target.parent), prefix=".AGENTS.md.", suffix=".tmp")
+        dir=os.fspath(target.parent), prefix=f".{target.name}.", suffix=".tmp")
     try:
         os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as handle:
@@ -119,7 +118,7 @@ def _write_atomic(target, original, mode, content):
             handle.flush()
             os.fsync(handle.fileno())
         if _read_agents(target)[0] != original:
-            raise ProjectError("AGENTS.md changed while it was being updated; retry")
+            raise ProjectError(f"{target.name} changed while it was being updated; retry")
         os.replace(temporary, target)
         temporary = None
         sync_directory(target.parent)
@@ -133,49 +132,76 @@ def _write_atomic(target, original, mode, content):
                 pass
 
 
-def attach(root):
-    """Add or refresh the managed block; return True when the file changed."""
-    repository = _repository_root(root)
-    target = repository / "AGENTS.md"
+def _coordinators(value):
+    if value == 'both':
+        return ('codex', 'claude')
+    if value in TARGETS:
+        return (value,)
+    raise ProjectError("coordinator must be codex, claude or both")
+
+
+def _prepare_attach(repository, runtime):
+    target = repository / TARGETS[runtime]
     original, mode = _read_agents(target)
     content = original if original is not None else b""
     marks = _locate(content)
     if marks is None:
         state = b"created" if original is None else (b"existing-content" if original else b"existing-empty")
-        block = _block_bytes(state)
+        block = _block_bytes(state, runtime)
         updated = content + (b"\n" if content else b"") + block
     else:
         begin, finish = marks
         state = _original_state(content, begin)
-        block = _block_bytes(state)
+        block = _block_bytes(state, runtime)
         updated = content[:begin] + block + content[_owned_span(content, begin, finish, state)[1]:]
-    if original is not None and updated == original:
-        return False
-    _write_atomic(target, original, mode if mode is not None else DEFAULT_MODE, updated)
-    return True
+    return target, original, mode, updated
 
 
-def detach(root):
-    """Remove the managed block; return True when the file changed."""
-    repository = _repository_root(root)
-    target = repository / "AGENTS.md"
+def _prepare_detach(repository, runtime):
+    target = repository / TARGETS[runtime]
     original, mode = _read_agents(target)
     if original is None:
-        return False
+        return target, None, mode, None, False
     marks = _locate(original)
     if marks is None:
-        return False
+        return target, original, mode, original, False
     begin, finish = marks
     state = _original_state(original, begin)
     start, end = _owned_span(original, begin, finish, state)
     updated = original[:start] + original[end:]
-    if updated == original:
-        return False
-    if not updated and state == b"created":
-        if _read_agents(target)[0] != original:
-            raise ProjectError("AGENTS.md changed while it was being updated; retry")
-        os.unlink(target)
-        sync_directory(target.parent)
-        return True
-    _write_atomic(target, original, mode, updated)
-    return True
+    remove = not updated and state == b"created"
+    return target, original, mode, updated, remove
+
+
+def attach(root, coordinator='codex'):
+    """Add or refresh managed blocks; return True when any target changed."""
+    runtimes = _coordinators(coordinator)
+    repository = _repository_root(root)
+    prepared = [_prepare_attach(repository, runtime) for runtime in runtimes]
+    changed = False
+    for target, original, mode, updated in prepared:
+        if original is not None and updated == original:
+            continue
+        _write_atomic(target, original, mode if mode is not None else DEFAULT_MODE, updated)
+        changed = True
+    return changed
+
+
+def detach(root, coordinator='codex'):
+    """Remove managed blocks; return True when any target changed."""
+    runtimes = _coordinators(coordinator)
+    repository = _repository_root(root)
+    prepared = [_prepare_detach(repository, runtime) for runtime in runtimes]
+    changed = False
+    for target, original, mode, updated, remove in prepared:
+        if original is None or updated == original:
+            continue
+        if remove:
+            if _read_agents(target)[0] != original:
+                raise ProjectError(f"{target.name} changed while it was being updated; retry")
+            os.unlink(target)
+            sync_directory(target.parent)
+        else:
+            _write_atomic(target, original, mode, updated)
+        changed = True
+    return changed

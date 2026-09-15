@@ -19,6 +19,7 @@ import tomllib
 
 
 MODEL = 'deepseek-flash'
+CLAUDE_BASE_URL = 'https://api.deepseek.com/anthropic'
 PROVIDER = {
     'name': 'DeepSeek', 'base_url': 'https://api.deepseek.com/',
     'env_key': 'DEEPSEEK_API_KEY', 'wire_api': 'responses',
@@ -109,7 +110,6 @@ def provider_config(home):
         provider = config['model_providers']['deepseek']
     except (OSError, ValueError, KeyError, TypeError):
         raise WorkerError(78, 'Missing or invalid USER-LEVEL DeepSeek provider config.') from None
-    # Reject redirects, inline credentials and silently inherited provider auth.
     if not isinstance(provider, dict) or set(provider) - set(PROVIDER):
         raise WorkerError(78, 'Unsupported DeepSeek provider fields; review user config.')
     for key in ['name', 'base_url', 'env_key', 'wire_api']:
@@ -162,14 +162,32 @@ def acquire_slot(state):
             os.close(directory)
 
 
-def child_environment(home, key):
-    # Keep only runtime essentials. OpenAI/SSH/cloud credentials never propagate.
-    allow = ['PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ',
-             'SSL_CERT_FILE', 'SSL_CERT_DIR']
-    env = {name: os.environ[name] for name in allow if name in os.environ}
-    env.update(CODEX_HOME=str(home), DEEPSEEK_API_KEY=key,
-               RUST_LOG='off', RUST_BACKTRACE='0', NO_COLOR='1')
-    return env
+def child_environment(home, key, runtime='codex'):
+    """Build a minimal child environment without parent provider credentials."""
+    common = ['PATH', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ',
+              'SSL_CERT_FILE', 'SSL_CERT_DIR']
+    if runtime == 'codex':
+        common.append('HOME')
+    env = {name: os.environ[name] for name in common if name in os.environ}
+    env.update(RUST_LOG='off', RUST_BACKTRACE='0', NO_COLOR='1')
+    if runtime == 'codex':
+        env.update(CODEX_HOME=str(home), DEEPSEEK_API_KEY=key)
+        return env
+    if runtime == 'claude':
+        env.update(
+            HOME=str(home),
+            ANTHROPIC_BASE_URL=CLAUDE_BASE_URL,
+            ANTHROPIC_AUTH_TOKEN=key,
+            ANTHROPIC_MODEL=MODEL,
+            ANTHROPIC_DEFAULT_OPUS_MODEL=MODEL,
+            ANTHROPIC_DEFAULT_SONNET_MODEL=MODEL,
+            ANTHROPIC_DEFAULT_HAIKU_MODEL=MODEL,
+            CLAUDE_CODE_SUBAGENT_MODEL=MODEL,
+            DISABLE_TELEMETRY='1',
+            DISABLE_ERROR_REPORTING='1',
+        )
+        return env
+    raise WorkerError(64, f'Unsupported worker runtime: {runtime}.')
 
 
 def transient_config(home):
@@ -180,7 +198,7 @@ def transient_config(home):
     (home / 'config.toml').chmod(0o600)
 
 
-def command(binary, write_paths=()):
+def _codex_command(binary, write_paths=()):
     args = [binary, 'exec', '--strict-config', '--ephemeral', '--json',
             '--ignore-rules', '--color', 'never', '--sandbox',
             'workspace-write' if write_paths else 'read-only',
@@ -218,6 +236,37 @@ def command(binary, write_paths=()):
     return args + ['-']
 
 
+def _claude_command(binary, write_paths=()):
+    tools = 'Read,Glob,Grep,Edit,Write' if write_paths else 'Read,Glob,Grep'
+    instructions = WRITE_INSTRUCTIONS if write_paths else INSTRUCTIONS
+    if write_paths:
+        instructions += '\nAllowed files: ' + json.dumps(list(write_paths))
+    return [
+        binary, '--bare', '-p', '--no-session-persistence',
+        '--output-format', 'json', '--permission-mode', 'dontAsk',
+        '--tools', tools, '--allowedTools', tools,
+        '--append-system-prompt', instructions,
+    ]
+
+
+def command(binary, write_paths=(), runtime='codex'):
+    if runtime == 'codex':
+        return _codex_command(binary, write_paths)
+    if runtime == 'claude':
+        return _claude_command(binary, write_paths)
+    raise WorkerError(64, f'Unsupported worker runtime: {runtime}.')
+
+
+def resolve_runtime(requested, codex='codex', claude='claude'):
+    candidates = [('codex', codex), ('claude', claude)] if requested == 'auto' else [(requested, codex if requested == 'codex' else claude)]
+    for runtime, executable in candidates:
+        binary = shutil.which(executable)
+        if binary:
+            return runtime, binary
+    label = 'Codex or Claude Code' if requested == 'auto' else ('Codex' if requested == 'codex' else 'Claude Code')
+    raise WorkerError(78, f'{label} executable is unavailable.')
+
+
 def stop_group(process):
     for sig in [signal.SIGTERM, signal.SIGKILL]:
         try:
@@ -234,8 +283,6 @@ def execute(args, env, task, timeout):
         payload = task.encode('utf-8')
     except UnicodeError:
         raise WorkerError(70, 'Worker task is not valid UTF-8.') from None
-    # Decode only after reaping the process, including the timeout path. Malformed
-    # output must never escape as a traceback or be published as a valid answer.
     process = subprocess.Popen(args, env=env, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                start_new_session=True)
@@ -253,7 +300,7 @@ def execute(args, env, task, timeout):
     try:
         return code, out.decode('utf-8'), err.decode('utf-8')
     except UnicodeError:
-        raise WorkerError(70, 'Codex returned invalid UTF-8 output; no answer was accepted.') from None
+        raise WorkerError(70, 'Worker runtime returned invalid UTF-8 output; no answer was accepted.') from None
 
 
 def result_events(raw):
@@ -291,8 +338,33 @@ def result_events(raw):
     return '\n\n'.join(messages), '\n'.join(errors), completed and not failed
 
 
+def claude_result(raw):
+    try:
+        value = json.loads(raw)
+    except (ValueError, RecursionError):
+        raise WorkerError(70, 'Claude Code returned malformed JSON; no answer was accepted.') from None
+    if not isinstance(value, dict):
+        raise WorkerError(70, 'Claude Code returned an invalid result object.')
+    kind = value.get('type', 'result')
+    is_error = value.get('is_error')
+    result = value.get('result')
+    if kind != 'result' or type(is_error) is not bool or not isinstance(result, str):
+        raise WorkerError(70, 'Claude Code returned an incomplete result object.')
+    if is_error:
+        return '', result or 'Claude Code worker turn failed.', False
+    return result, '', True
+
+
+def runtime_result(runtime, raw):
+    if runtime == 'codex':
+        return result_events(raw)
+    if runtime == 'claude':
+        return claude_result(raw)
+    raise WorkerError(64, f'Unsupported worker runtime: {runtime}.')
+
+
 def run(args):
-    if os.environ.get('CODEX_DEEPSEEK_DISABLED') == '1':
+    if os.environ.get('DEEPSEEK_TEAM_DISABLED') == '1' or os.environ.get('CODEX_DEEPSEEK_DISABLED') == '1':
         raise WorkerError(69, 'DeepSeek delegation disabled; the coordinator should continue locally.')
     if not args.write:
         return run_worker(args, None)
@@ -313,34 +385,33 @@ def run_worker(args, scope):
     key = load_api_key()
     if not key.strip():
         raise WorkerError(78, 'DEEPSEEK_API_KEY and saved credential are absent or empty; configure locally, never in chat or project files.')
-    provider_config(codex_home())
-    binary = shutil.which(args.codex)
-    if not binary:
-        raise WorkerError(78, 'Codex executable is unavailable.')
+    runtime, binary = resolve_runtime(args.runtime, args.codex, args.claude)
+    if runtime == 'codex':
+        provider_config(codex_home())
     task = args.task if args.task is not None else sys.stdin.read()
     if not task.strip():
         raise WorkerError(64, 'Pass a task on stdin or as one argument.')
     slot = acquire_slot(args.state_dir)
     deadline = time.monotonic() + args.timeout if args.timeout else None
     try:
-        # Isolate auth, plugins, logs, history and SQLite from the coordinator session.
-        # Only the validated nonsecret provider is reconstructed here.
         with tempfile.TemporaryDirectory(prefix='session-', dir=args.state_dir) as directory:
             home = Path(directory)
-            transient_config(home)
-            env = child_environment(home, key)
+            if runtime == 'codex':
+                transient_config(home)
+            env = child_environment(home, key, runtime)
             for attempt in range(args.attempts):
                 remaining = deadline - time.monotonic() if deadline is not None else None
                 if remaining is not None and remaining <= 0:
                     raise WorkerError(124, 'DeepSeek worker exceeded its total timeout.')
-                code, out, err = execute(command(binary, args.allow_write), env, task, remaining)
+                code, out, err = execute(command(binary, args.allow_write, runtime), env, task, remaining)
                 if scope is not None:
                     scope.verify()
-                message, errors, completed = result_events(out)
+                message, errors, completed = runtime_result(runtime, out)
                 diagnostics = redact(err + ('\n' + errors if errors else ''), key)
                 if code == 0 and (not completed or not message.strip()):
                     code = 70
-                    diagnostics += '\nCodex returned no completed answer.\n'
+                    if not diagnostics.strip():
+                        diagnostics = f'{runtime.title()} returned no completed answer.'
                 if code and code != 124 and RETRYABLE.search(diagnostics) and attempt + 1 < args.attempts:
                     delay = 2 ** (attempt + 1) + random.uniform(0, 0.25)
                     if deadline is None or time.monotonic() + delay < deadline:
@@ -361,14 +432,17 @@ def run_worker(args, scope):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('task', nargs='?', help='Task; stdin is preferred for private content.')
+    parser.add_argument('--runtime', choices=['codex', 'claude', 'auto'], default='codex',
+                        help='CLI harness for the DeepSeek worker; default keeps legacy Codex behavior.')
     parser.add_argument('--timeout', type=float, default=0,
                         help='0: wait without a total deadline (default); 1..900: explicit total limit in seconds, including retries.')
     parser.add_argument('--attempts', type=int, choices=[1, 2, 3],
                         help='Read-only: 2 by default. Writer: exactly 1, never retry partial edits.')
-    parser.add_argument('--write', action='store_true', help='Opt in to writing in a clean linked worktree on a codex/ branch.')
+    parser.add_argument('--write', action='store_true', help='Opt in to writing in a clean linked worktree on a codex/ or deepseek/ branch.')
     parser.add_argument('--allow-write', action='append', default=[], metavar='FILE',
                         help='Exact repository-relative source file allowed to change; repeat for each file.')
     parser.add_argument('--codex', default='codex', help='Codex executable to use.')
+    parser.add_argument('--claude', default='claude', help='Claude Code executable to use.')
     parser.add_argument('--state-dir', type=Path,
                         default=Path.home() / '.local/state/codex-deepseek',
                         help='Shared lock directory; keep the same directory for all workers.')
@@ -395,7 +469,6 @@ def main():
         print('DeepSeek worker cancelled.', file=sys.stderr)
         return 130
     except OSError:
-        # Exception strings can include external command output or sensitive paths.
         print('DeepSeek runner could not start or clean up its process; the coordinator should continue locally.', file=sys.stderr)
         return 71
 
