@@ -132,7 +132,8 @@ def check_runtime(runtime):
         return
     version = subprocess.check_output(['claude', '--version'], text=True).strip()
     help_text = subprocess.check_output(['claude', '--help'], text=True)
-    required = ['--bare', '--output-format', '--no-session-persistence', '--permission-mode', '--tools', '--allowedTools']
+    required = ['--bare', '--output-format', '--no-session-persistence', '--permission-mode',
+                '--tools', '--allowedTools', '--disallowedTools']
     if not all(flag in help_text for flag in required):
         raise worker.WorkerError(78, 'Claude Code lacks required non-interactive isolation options; update Claude Code before using workers.')
     print(version)
