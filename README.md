@@ -11,8 +11,8 @@ Version **0.2.0** supports **Linux, Python 3.11+, Git, and Codex CLI and/or Clau
 Install the coordinator CLI(s) you intend to use, then clone this repository:
 
 ```bash
-git clone https://github.com/kirill31337/codex-deepseek-team.git
-cd codex-deepseek-team
+git clone https://github.com/kirill31337/deepseek-team.git
+cd deepseek-team
 python3 install.py
 export PATH="$HOME/.local/bin:$PATH"
 ```
