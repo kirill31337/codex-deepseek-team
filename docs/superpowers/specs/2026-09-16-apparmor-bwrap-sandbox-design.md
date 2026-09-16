@@ -8,7 +8,7 @@ Add a fail-closed Linux OS isolation layer to DeepSeek workers with first-class 
 
 The OS layer is **hybrid**, because current Codex on Linux already creates its own Bubblewrap/user-namespace sandbox:
 
-- **Codex runtime:** keep Codex `read-only` / `workspace-write` as the actual process/filesystem sandbox. DeepSeek Team first probes a known-working `bwrap` backend, then places a private `bwrap` shim at the front of the temporary worker `PATH`. The shim invokes either the probed system `bwrap` directly or `aa-exec -p deepseek-team-bwrap -- bwrap`. This makes Codex's own native sandbox use the verified/AppArmor-aware executable without nesting Codex inside another user namespace.
+- **Codex runtime:** keep Codex `read-only` / `workspace-write` as the actual process/filesystem sandbox. DeepSeek Team first probes a known-working `bwrap` backend, then places a private `bwrap` shim at the front of the temporary worker `PATH`. The shim invokes either the probed system `bwrap` directly or `aa-exec -p deepseek-team-bwrap -- bwrap`, and guarantees `--disable-userns` exactly once. This makes Codex's own native sandbox use the verified/AppArmor-aware executable without nesting Codex inside another user namespace, while preventing further user namespaces inside the completed worker sandbox.
 - **Claude Code runtime:** run the whole isolated `--bare` Claude harness inside an outer DeepSeek Team Bubblewrap namespace. Claude keeps its restricted built-in tools, path-scoped writer permissions, no Bash/web/agents and explicit MCP denial.
 - **Both runtimes:** `WriteScope` remains the result-acceptance boundary for writer work and still verifies HEAD, branch, index and changed paths after execution.
 
@@ -17,6 +17,8 @@ A usable Bubblewrap backend is required before the DeepSeek credential is read. 
 ## Why Codex is not outer-wrapped
 
 Putting current Codex inside an outer `bwrap --disable-userns` would block Codex from constructing its own inner Linux sandbox. Allowing arbitrary nested user namespaces just to make double-bwrap work would weaken the intended boundary. Therefore DeepSeek Team verifies and supplies the `bwrap` path that Codex itself uses rather than wrapping Codex a second time.
+
+The private shim applies `--disable-userns` only to the Bubblewrap invocation itself. If upstream Codex already supplies the flag, the shim detects it and does not add a duplicate. This lets Codex create the one required sandbox user namespace but prevents processes inside that sandbox from opening additional user namespaces afterwards.
 
 This preserves Codex's native sandbox semantics and avoids a second namespace layer whose behavior could drift from Codex releases.
 
@@ -62,7 +64,7 @@ The profile is selected only for our Bubblewrap path through:
 aa-exec -p deepseek-team-bwrap -- /usr/bin/bwrap ...
 ```
 
-The AppArmor profile's narrow role is to permit the initial user namespace on hosts where the Ubuntu restriction blocks direct Bubblewrap. Bubblewrap itself supplies the mount/process/capability sandbox. For the outer Claude sandbox, `--disable-userns` prevents the payload from creating further user namespaces. For Codex, the same AppArmor-aware bwrap shim is used by Codex's own native sandbox.
+The AppArmor profile's narrow role is to permit the initial user namespace on hosts where the Ubuntu restriction blocks direct Bubblewrap. Bubblewrap itself supplies the mount/process/capability sandbox. For the outer Claude sandbox, `--disable-userns` prevents the payload from creating further user namespaces. For Codex, the AppArmor-aware bwrap shim both selects the profile and guarantees `--disable-userns` on Codex's own native Bubblewrap invocation.
 
 Backend selection is capability based:
 
@@ -107,7 +109,7 @@ Regression coverage includes:
 - required feature probing and fail-closed behavior;
 - Claude read-only/read-write worktree mount modes;
 - real HOME masking, temporary HOME binding, runtime-root re-exposure and credential-store masks;
-- private direct/AppArmor Codex `bwrap` shims;
+- private direct/AppArmor Codex `bwrap` shims, including exact-once `--disable-userns` injection;
 - worker sandbox resolution before API-key reads;
 - outer Claude wrapping versus native Codex sandbox preparation;
 - `--os-sandbox off` as an explicit-only bypass;
