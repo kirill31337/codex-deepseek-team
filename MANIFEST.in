@@ -1,3 +1,4 @@
 include LICENSE README.md install.py
 recursive-include tests *.py
 recursive-include src/codex_deepseek_team/data *.md
+recursive-include src/codex_deepseek_team/data/apparmor *
