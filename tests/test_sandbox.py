@@ -181,7 +181,30 @@ class CodexWrapperTests(unittest.TestCase):
             self.assertTrue(wrapper.is_file())
             self.assertEqual(wrapper.stat().st_mode & 0o777, 0o700)
             self.assertEqual(wrapper.parent.stat().st_mode & 0o777, 0o700)
-            self.assertIn("exec /usr/bin/bwrap \"$@\"", wrapper.read_text())
+            text = wrapper.read_text()
+            self.assertIn('/usr/bin/bwrap', text)
+            self.assertIn('--disable-userns', text)
+
+    def test_codex_shim_injects_disable_userns_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = root / 'args.txt'
+            fake_bwrap = root / 'system-bwrap'
+            fake_bwrap.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$@" > ' + str(record) + '\n')
+            fake_bwrap.chmod(0o700)
+            home = root / 'session'
+            home.mkdir()
+            backend = sandbox.SandboxBackend((str(fake_bwrap),), str(fake_bwrap), 'direct')
+            env = sandbox.prepare_codex_environment(home, {'PATH': '/usr/bin'}, backend)
+            wrapper = Path(env['PATH'].split(':', 1)[0]) / 'bwrap'
+            subprocess.run([str(wrapper), '--unshare-user', '--ro-bind', '/', '/', '/bin/true'], check=True)
+            args = record.read_text().splitlines()
+            self.assertEqual(args.count('--disable-userns'), 1)
+            self.assertIn('--unshare-user', args)
+            subprocess.run([str(wrapper), '--disable-userns', '--unshare-user', '/bin/true'], check=True)
+            args = record.read_text().splitlines()
+            self.assertEqual(args.count('--disable-userns'), 1)
 
     def test_apparmor_backend_shim_selects_named_profile_without_secrets(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -196,6 +219,7 @@ class CodexWrapperTests(unittest.TestCase):
             self.assertIn('aa-exec', text)
             self.assertIn(sandbox.PROFILE_NAME, text)
             self.assertIn('/usr/bin/bwrap', text)
+            self.assertIn('--disable-userns', text)
             self.assertNotIn('DO_NOT_COPY_TO_SCRIPT', text)
 
 
