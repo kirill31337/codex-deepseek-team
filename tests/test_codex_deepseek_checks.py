@@ -35,7 +35,7 @@ class CheckTests(unittest.TestCase):
                  mock.patch.object(check.worker, 'load_api_key') as key, \
                  mock.patch('urllib.request.build_opener') as network, \
                  mock.patch('sys.stdout', new_callable=io.StringIO) as output:
-                self.assertEqual(check.main(['--offline']), 0)
+                self.assertEqual(check.main(['--offline', '--os-sandbox', 'off']), 0)
                 self.assertIn('example-primary', output.getvalue())
                 key.assert_not_called()
                 network.assert_not_called()
@@ -58,7 +58,7 @@ class CheckTests(unittest.TestCase):
             clock = time.monotonic
             with mock.patch.object(check, 'HERE', root), \
                  mock.patch.object(subprocess, '_time', side_effect=lambda: clock() * 1000):
-                result = check.call('synthetic task')
+                result = check.call('synthetic task', os_sandbox='off')
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), 'delayed answer')
 
