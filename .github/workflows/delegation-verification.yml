@@ -1,0 +1,26 @@
+name: Delegation verification
+on:
+  push:
+    branches: [deepseek/delegation-profiles]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: PYTHONPATH=src python -m unittest discover -s tests -v
+      - name: Export tracked source for offline verification
+        run: git bundle create /tmp/deepseek-team-source.bundle HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-team-source
+          path: /tmp/deepseek-team-source.bundle
+          retention-days: 3
