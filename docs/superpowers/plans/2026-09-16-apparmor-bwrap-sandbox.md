@@ -57,10 +57,10 @@ The package never writes `kernel.apparmor_restrict_unprivileged_userns=0` and ne
 - [x] Managed AGENTS/CLAUDE guidance requires the OS sandbox and forbids normal use of `--os-sandbox off`.
 - [x] README documents Ubuntu setup, named-profile collision avoidance, hybrid Codex/Claude architecture, network limitation and stronger-isolation caveat.
 - [x] HARDENING documents the 0.3 boundary.
-- [ ] Add Ubuntu Bubblewrap/AppArmor CI smoke attempt.
-- [ ] Run final Python 3.11/3.12/3.13 suite, wheel/sdist install and both CLI aliases on the exact release SHA.
-- [ ] Record exact final verification evidence in `docs/VERIFICATION.md`.
-- [ ] Compare final branch to `main` and fast-forward only after mandatory matrix jobs are green.
+- [x] Add Ubuntu Bubblewrap/AppArmor CI smoke attempt.
+- [x] Run Python 3.11/3.12/3.13 suite, wheel/sdist install and both CLI aliases on the release candidate.
+- [x] Record verification evidence in `docs/VERIFICATION.md`, including the live Ubuntu named-profile + Bubblewrap probe.
+- [ ] Compare the final branch to `main` and fast-forward only after the exact final SHA passes the mandatory matrix and sandbox-smoke jobs.
 
 ## Release verification commands
 
@@ -72,11 +72,13 @@ codex-deepseek-team --version
 deepseek-team --version
 ```
 
-Additionally, CI attempts:
+CI additionally runs on Ubuntu 24.04:
 
 ```bash
+apparmor_parser -Q -K src/codex_deepseek_team/data/apparmor/deepseek-team-bwrap
 deepseek-team sandbox install-apparmor
 deepseek-team sandbox status
+aa-exec -p deepseek-team-bwrap -- bwrap ... /usr/bin/true
 ```
 
-on Ubuntu 24.04. A hosted-runner kernel/AppArmor limitation must be reported as such; deterministic tests are not to be misrepresented as proof of live AppArmor enforcement.
+The release candidate demonstrated a working AppArmor backend with `kernel.apparmor_restrict_unprivileged_userns=1`; the final documentation-only SHA is still required to pass the same CI before `main` moves.
