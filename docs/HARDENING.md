@@ -1,87 +1,69 @@
-# Worker boundary hardening (2026-09-15)
+# Worker boundary hardening
 
-This patch strengthens admission and result verification without changing the
-coordinator/provider routing, the default unlimited wait, the three-worker limit,
-or the single-attempt writer policy. It adds no runtime dependencies.
+## 0.3.0 — Bubblewrap + Ubuntu AppArmor (2026-09-16)
 
-## Writer verification
+DeepSeek Team now requires a usable Linux Bubblewrap backend before a worker reads the DeepSeek credential. There is no automatic unsandboxed fallback. An explicit `--os-sandbox off` exists only for diagnosis/legacy compatibility, prints a warning, and is never emitted by managed `AGENTS.md` / `CLAUDE.md` instructions.
 
-Previously, ordinary `git diff` could miss protected-file edits when index entries
-used `assume-unchanged` or `skip-worktree`, or when `core.filemode=false` hid an
-executable-bit change. Inherited `GIT_INDEX_FILE` could also redirect verification
-to a different index. These cases could admit a dirty worktree or accept a change
-outside the declared file allowlist.
+### Ubuntu user namespaces
 
-The verifier now uses a minimal environment, ignores inherited Git overrides and
-global/system configuration, forces executable-bit checks, and refuses nonstandard
-index flags both before execution and before accepting a result. It does not clear
-flags, reset files, or discard the rejected work. The ordinary linked-worktree
-`.git` pointer must not be a symlink/hardlink and must remain unchanged.
+Ubuntu can mediate unprivileged user namespace creation through AppArmor. DeepSeek Team does **not** disable `kernel.apparmor_restrict_unprivileged_userns` and does not replace a distro `/usr/bin/bwrap` attachment policy. It ships a named profile, `deepseek-team-bwrap`, with no executable attachment and selects it explicitly through `aa-exec` only when a direct Bubblewrap probe is blocked by the Ubuntu AppArmor userns restriction.
 
-Verification itself runs outside the Codex sandbox. Repository-configured
-`core.fsmonitor` helpers and Git clean/process filters could previously execute
-there. Filesystem monitors and hooks are now disabled for verifier commands;
-external diff and text conversion are disabled explicitly. Active configured
-clean/process filters are detected before running a diff and cause a safe refusal.
-Submodule index entries are refused rather than recursively inspected.
+The profile is intentionally unconfined for ordinary resources and grants `userns`. Its role is to permit the initial namespace; Bubblewrap defines the actual process/mount/capability policy. Installation/removal is conservative:
 
-### Writer compatibility
+- a different, symlinked or non-regular `/etc/apparmor.d/deepseek-team-bwrap` is refused;
+- an exact package profile can be reloaded with `apparmor_parser -r`;
+- removal is allowed only when installed bytes still exactly match the package copy;
+- administrator-modified policy is never deleted automatically;
+- no sysctl is changed.
 
-Use an ordinary, clean, full linked worktree on a `codex/` branch. Writer mode now
-refuses repositories containing submodule entries, nonstandard index flags, or
-tracked/allowed files using locally configured external clean/process filters
-(including applicable local Git LFS filter configuration). A newly introduced
-filter attribute is checked again before the result diff. Other Git attributes,
-including an explicitly disabled filter, remain supported when they do not select
-an executable filter. Global/system Git settings are not used by the verifier.
+### Codex: preserve the native Linux sandbox
 
-Admission failures return 78; detected result violations return 73. Existing
-rejected/partial files are preserved for the coordinator to inspect. Do not remove
-project features blindly to satisfy these checks; use read-only delegation or do
-that task in the coordinator when the worktree is not supported.
+Current Codex on Linux already builds its own Bubblewrap sandbox. DeepSeek Team therefore does not put Codex inside a second user namespace. It probes a working direct/AppArmor-aware `bwrap` backend, creates a private temporary `bwrap` shim and places it first on the worker `PATH`. Codex then constructs its normal `read-only` / `workspace-write` sandbox through that verified executable.
 
-The path allowlist is still a **post-execution result check**, not a per-file OS
-sandbox. These checks do not prove that arbitrary hostile processes, concurrent
-filesystem races, or all readable host files are contained. Stronger isolation
-requires a separate OS user/container. No new confidentiality guarantee is made.
+The shim contains only the executable/profile prefix; provider credentials remain in the sanitized child environment and are never written into the script or argv.
 
-## Runtime and output integrity
+### Claude Code: outer Bubblewrap
 
-An environment API key now receives the same basic ASCII/length/whitespace checks
-as a saved key, before starting Codex. Invalid values are not printed. An explicit
-empty environment key still overrides a saved credential.
+The isolated Claude worker harness runs inside an outer Bubblewrap namespace. The policy uses a read-only root, fresh user/PID/IPC/UTS namespaces, dropped capabilities, private temporary directories, a temporary writable worker HOME, and a worktree mounted read-only for review or read-write for writer mode. The real user HOME is hidden and only runtime roots needed to start the CLI are re-exposed read-only; common credential locations are then masked again.
 
-The state directory and lock files must be private, owned by the current user,
-and of the expected file type. Symlinked directories, FIFO locks, hardlinked locks,
-and publicly accessible locks are rejected without changing their permissions or
-contents. Normal parallel execution and cancellation retain their existing behavior.
+The outer Claude policy intentionally keeps the host network namespace because the CLI must reach the DeepSeek API. This feature does not claim network isolation. Claude still exposes no Bash/web/agent tools to the worker and explicitly denies MCP tools.
 
-The worker now rejects malformed nonblank JSON event records even if a completed
-answer appears elsewhere in the stream. Event types must be nonempty strings;
-unknown named event types and blank lines remain forward-compatible. Subprocess
-output is decoded after cleanup, and invalid UTF-8 yields a controlled error
-instead of a traceback or an accepted partial answer. Failures never publish the
-candidate answer. Raw malformed output is not included in the error message.
+### What this does not prove
 
-## Verification
+Bubblewrap/AppArmor significantly strengthen the host boundary, but this package is not a replacement for a separate OS user/container/VM for arbitrary hostile source trees. The worktree is intentionally visible to the worker, and runtime files required to start the coordinator can be exposed read-only. A secret committed or stored inside an allowed source tree should be treated as readable project data.
 
-Twenty-five new regression tests cover the cases above. Writer tests use real Git
-repositories and linked worktrees, including synthetic executable hooks/filters
-that must not run. Runtime tests use fake Codex subprocesses and synthetic keys.
-The original worker/writer tests remain unchanged.
+`WriteScope` remains the authoritative result acceptance boundary for writer work: exact allowed paths, clean linked worktree, index/HEAD/branch checks, and rejected partial work preservation are unchanged.
+
+## 0.1/0.2 — Git and output integrity (2026-09-15)
+
+### Writer verification
+
+Ordinary `git diff` can miss protected-file edits when index entries use `assume-unchanged` or `skip-worktree`, or when `core.filemode=false` hides an executable-bit change. Inherited `GIT_INDEX_FILE` can redirect verification to a different index. DeepSeek Team therefore uses a minimal Git environment, ignores inherited index/global/system overrides, forces executable-bit checks, and refuses nonstandard index flags before execution and before accepting a result.
+
+The linked-worktree `.git` pointer must not be a symlink/hardlink and must remain unchanged. Verification itself runs outside the model sandbox, so repository-configured `core.fsmonitor`, hooks, clean/process filters, external diff and textconv are disabled or refused as appropriate. Submodule index entries are refused rather than recursively inspected.
+
+Writer mode requires an ordinary, clean, full linked worktree on a `codex/` or `deepseek/` branch. It refuses repositories containing submodule entries, nonstandard index flags, or tracked/allowed files using locally configured external clean/process filters. Admission failures return 78; detected result violations return 73. Rejected/partial files are preserved for coordinator inspection.
+
+### Runtime and output integrity
+
+Environment API keys receive the same ASCII/length/whitespace checks as saved keys. The state directory and worker locks must be private, current-user-owned regular filesystem objects; symlinked directories, FIFO locks, hardlinked locks and public locks are rejected without mutating them.
+
+Malformed nonblank JSON events, invalid event types and invalid UTF-8 output are rejected without publishing candidate answers. Unknown named event types and blank lines remain forward-compatible. Failures never publish partial answers or raw malformed model output.
+
+## Verification commands
 
 ```bash
+deepseek-team sandbox status
+deepseek-team doctor --runtime both --offline
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-The existing GitHub Actions workflow also builds and installs the wheel on Python
-3.11, 3.12 and 3.13. No real DeepSeek API request or live Codex sandbox validation
-is part of these new tests; those remain separate `doctor --live` checks requiring
-a locally configured API key and incurring provider charges.
+`doctor --live` remains a separate, billable end-to-end check requiring a configured DeepSeek credential. Unit/CI tests use synthetic credentials and transports and must not be represented as proof of a live provider request.
 
 ## References
 
 - Git index flags: https://git-scm.com/docs/git-ls-files
-- Attribute inspection: https://git-scm.com/docs/git-check-attr
-- Clean/process filters: https://git-scm.com/docs/gitattributes
-- Git configuration and filesystem monitors: https://git-scm.com/docs/git-config
+- Git attributes: https://git-scm.com/docs/gitattributes
+- Git configuration: https://git-scm.com/docs/git-config
+- Bubblewrap: https://github.com/containers/bubblewrap
+- AppArmor unprivileged user namespaces: https://documentation.ubuntu.com/security/security-features/privilege-restriction/apparmor/
