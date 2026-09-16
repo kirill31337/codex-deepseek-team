@@ -1,6 +1,7 @@
 """Installer ownership tests using mocked environments."""
 import importlib.util
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -35,6 +36,40 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(command.resolve(), self.prefix / 'venv/bin' / command_name)
         self.assertEqual({p.name for p in self.bin.iterdir()}, set(installer.COMMANDS))
         self.assertEqual(run.call_count, 2)
+
+    def test_with_sandbox_is_explicit_and_runs_ubuntu_system_setup_after_install(self):
+        calls = []
+        def run(args, **kwargs):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, '', '')
+        with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
+             mock.patch.object(installer, 'is_ubuntu', return_value=True, create=True), \
+             mock.patch.object(installer.subprocess, 'run', side_effect=run):
+            self.assertEqual(installer.main([*self.args, '--with-sandbox']), 0)
+        pip = str(self.prefix / 'venv/bin/python')
+        team = str(self.prefix / 'venv/bin/deepseek-team')
+        self.assertTrue(any(call[:4] == [pip, '-m', 'pip', 'install'] for call in calls))
+        self.assertIn(['sudo', 'apt-get', 'install', '-y', 'bubblewrap', 'apparmor'], calls)
+        self.assertIn([team, 'sandbox', 'install-apparmor'], calls)
+        self.assertIn([team, 'sandbox', 'status'], calls)
+
+    def test_plain_install_never_invokes_privileged_sandbox_setup(self):
+        calls = []
+        def run(args, **kwargs):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, '', '')
+        with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
+             mock.patch.object(installer.subprocess, 'run', side_effect=run):
+            self.assertEqual(installer.main(self.args), 0)
+        flattened = '\n'.join(' '.join(call) for call in calls)
+        self.assertNotIn('sudo', flattened)
+        self.assertNotIn('install-apparmor', flattened)
+
+    def test_with_sandbox_refuses_non_ubuntu_instead_of_guessing_system_policy(self):
+        with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
+             mock.patch.object(installer, 'is_ubuntu', return_value=False, create=True), \
+             mock.patch.object(installer.subprocess, 'run'):
+            self.assertEqual(installer.main([*self.args, '--with-sandbox']), 78)
 
     def test_foreign_prefix_is_never_modified(self):
         self.prefix.mkdir()
