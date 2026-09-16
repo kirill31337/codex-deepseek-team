@@ -30,4 +30,4 @@ deepseek-team = "codex_deepseek_team.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-codex_deepseek_team = ["data/*.md"]
+codex_deepseek_team = ["data/*.md", "data/apparmor/*"]
