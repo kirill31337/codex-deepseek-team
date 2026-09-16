@@ -97,12 +97,14 @@ wire_api = "responses"
                         CODEX_HOME=str(self.user),
                         OPENAI_API_KEY=secrets.token_hex(24))
         self.env.pop('CODEX_DEEPSEEK_DISABLED', None)
+        self.env.pop('DEEPSEEK_TEAM_DISABLED', None)
 
     def run_worker(self, task='fixture task', mode='ok', **kwargs):
         env = dict(self.env)
         env.update(kwargs.pop('env', {}))
         return subprocess.run(
-            [sys.executable, str(SOURCE), '--codex', str(self.root / f'codex-{mode}'),
+            [sys.executable, str(SOURCE), '--os-sandbox', 'off',
+             '--codex', str(self.root / f'codex-{mode}'),
              '--state-dir', str(self.state), *kwargs.pop('args', [])],
             input=task, text=True, capture_output=True, env=env,
             cwd=self.repo, timeout=15, **kwargs)
@@ -305,7 +307,7 @@ wire_api = "responses"
         # A real child takes one second, while the deadline clock sees 1000.
         # The old 180-second default kills it instead of returning its answer.
         clock = time.monotonic
-        argv = ['worker', '--codex', str(self.root / 'codex-sleep'),
+        argv = ['worker', '--os-sandbox', 'off', '--codex', str(self.root / 'codex-sleep'),
                 '--state-dir', str(self.state), 'delayed answer']
         with mock.patch.dict(os.environ, self.env, clear=True), \
              mock.patch.object(sys, 'argv', argv), \
@@ -324,7 +326,8 @@ wire_api = "responses"
 
     def test_unlimited_worker_can_be_cancelled_and_cleans_up(self):
         process = subprocess.Popen(
-            [sys.executable, str(SOURCE), '--codex', str(self.root / 'codex-timeout'),
+            [sys.executable, str(SOURCE), '--os-sandbox', 'off',
+             '--codex', str(self.root / 'codex-timeout'),
              '--state-dir', str(self.state), 'fixture task'],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env,
             cwd=self.repo)
