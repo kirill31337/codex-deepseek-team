@@ -167,16 +167,13 @@ def child_environment(home, key, runtime='codex'):
     """Build a minimal child environment without parent provider credentials."""
     common = ['PATH', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ',
               'SSL_CERT_FILE', 'SSL_CERT_DIR']
-    if runtime == 'codex':
-        common.append('HOME')
     env = {name: os.environ[name] for name in common if name in os.environ}
-    env.update(RUST_LOG='off', RUST_BACKTRACE='0', NO_COLOR='1')
+    env.update(HOME=str(home), RUST_LOG='off', RUST_BACKTRACE='0', NO_COLOR='1')
     if runtime == 'codex':
         env.update(CODEX_HOME=str(home), DEEPSEEK_API_KEY=key)
         return env
     if runtime == 'claude':
         env.update(
-            HOME=str(home),
             ANTHROPIC_BASE_URL=CLAUDE_BASE_URL,
             ANTHROPIC_AUTH_TOKEN=key,
             ANTHROPIC_MODEL=CLAUDE_MODEL,
@@ -277,6 +274,39 @@ def resolve_runtime(requested, codex='codex', claude='claude'):
             return runtime, binary
     label = 'Codex or Claude Code' if requested == 'auto' else ('Codex' if requested == 'codex' else 'Claude Code')
     raise WorkerError(78, f'{label} executable is unavailable.')
+
+
+def _sandbox_module():
+    """Load the sibling support module even when this file is executed directly."""
+    name = '_deepseek_team_os_sandbox'
+    if name in sys.modules:
+        return sys.modules[name]
+    path = Path(__file__).resolve().with_name('sandbox.py')
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError('sandbox module spec unavailable')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+        return module
+    except (OSError, ImportError):
+        raise WorkerError(78, 'OS sandbox support is unavailable; reinstall DeepSeek Team.') from None
+
+
+def resolve_os_sandbox(policy):
+    if policy == 'off':
+        print('WARNING: DeepSeek Team OS sandbox disabled explicitly for this worker.', file=sys.stderr)
+        return None, None
+    sandbox = _sandbox_module()
+    try:
+        return sandbox, sandbox.probe_backend()
+    except sandbox.SandboxError as error:
+        raise WorkerError(error.code, error.message) from None
 
 
 def stop_group(process):
@@ -394,15 +424,16 @@ def run(args):
 
 
 def run_worker(args, scope):
-    key = load_api_key()
-    if not key.strip():
-        raise WorkerError(78, 'DEEPSEEK_API_KEY and saved credential are absent or empty; configure locally, never in chat or project files.')
     runtime, binary = resolve_runtime(args.runtime, args.codex, args.claude)
+    sandbox, backend = resolve_os_sandbox(args.os_sandbox)
     if runtime == 'codex':
         provider_config(codex_home())
     task = args.task if args.task is not None else sys.stdin.read()
     if not task.strip():
         raise WorkerError(64, 'Pass a task on stdin or as one argument.')
+    key = load_api_key()
+    if not key.strip():
+        raise WorkerError(78, 'DEEPSEEK_API_KEY and saved credential are absent or empty; configure locally, never in chat or project files.')
     slot = acquire_slot(args.state_dir)
     deadline = time.monotonic() + args.timeout if args.timeout else None
     try:
@@ -411,11 +442,25 @@ def run_worker(args, scope):
             if runtime == 'codex':
                 transient_config(home)
             env = child_environment(home, key, runtime)
+            if sandbox is not None and runtime == 'codex':
+                try:
+                    env = sandbox.prepare_codex_environment(home, env, backend)
+                except sandbox.SandboxError as error:
+                    raise WorkerError(error.code, error.message) from None
+            base_command = command(binary, args.allow_write, runtime)
+            if sandbox is not None and runtime == 'claude':
+                try:
+                    base_command = sandbox.wrap_command(
+                        base_command, cwd=Path.cwd(), session_home=home,
+                        writable=bool(args.write), env=env, backend=backend,
+                        real_home=Path.home())
+                except sandbox.SandboxError as error:
+                    raise WorkerError(error.code, error.message) from None
             for attempt in range(args.attempts):
                 remaining = deadline - time.monotonic() if deadline is not None else None
                 if remaining is not None and remaining <= 0:
                     raise WorkerError(124, 'DeepSeek worker exceeded its total timeout.')
-                code, out, err = execute(command(binary, args.allow_write, runtime), env, task, remaining)
+                code, out, err = execute(base_command, env, task, remaining)
                 if scope is not None:
                     scope.verify()
                 message, errors, completed = runtime_result(runtime, out)
@@ -446,6 +491,8 @@ def parse_args():
     parser.add_argument('task', nargs='?', help='Task; stdin is preferred for private content.')
     parser.add_argument('--runtime', choices=['codex', 'claude', 'auto'], default='codex',
                         help='CLI harness for the DeepSeek worker; default keeps legacy Codex behavior.')
+    parser.add_argument('--os-sandbox', choices=['required', 'off'], default='required',
+                        help='required: enforce Bubblewrap/AppArmor containment (default); off: explicit unsafe compatibility bypass.')
     parser.add_argument('--timeout', type=float, default=0,
                         help='0: wait without a total deadline (default); 1..900: explicit total limit in seconds, including retries.')
     parser.add_argument('--attempts', type=int, choices=[1, 2, 3],
