@@ -36,7 +36,10 @@ class CoordinatorProjectTests(unittest.TestCase):
         self.assertIn('worker --runtime claude', claude)
         for content in (agents, claude):
             self.assertIn('OS sandbox', content)
-            self.assertNotIn('--os-sandbox off', content)
+            self.assertIn('Never add `--os-sandbox off`', content)
+            self.assertNotIn('worker --os-sandbox off', content)
+            self.assertNotIn('--runtime codex --os-sandbox off', content)
+            self.assertNotIn('--runtime claude --os-sandbox off', content)
         self.assertFalse(project.attach(self.repo, coordinator='both'))
         self.assertTrue(project.detach(self.repo, coordinator='both'))
         self.assertFalse((self.repo / 'AGENTS.md').exists())
