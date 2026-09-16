@@ -1,20 +1,42 @@
 # DeepSeek Team
 
-One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to isolated DeepSeek workers. Workers are read-only by default and can opt into source creation/editing inside a clean linked Git worktree.
+One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to DeepSeek workers. Workers are read-only by default and can opt into source creation/editing inside a clean linked Git worktree.
 
 **The coordinator owns:** scope, architecture, security decisions, final diff review, tests and integration. **DeepSeek contributes:** focused research, review, boilerplate, tests and bounded implementation. The coordinator should verify the result rather than repeat the entire delegated investigation.
 
-Version **0.2.0** supports **Linux, Python 3.11+, Git, and Codex CLI and/or Claude Code CLI**. A DeepSeek API key is required for live work. There are no Python runtime dependencies. This is an independent community package.
+Version **0.3.0** supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
 
-## Install
+## Ubuntu install — recommended
 
-Install the coordinator CLI(s) you intend to use, then clone this repository:
+Install the coordinator CLI(s) you intend to use, then:
 
 ```bash
 git clone https://github.com/kirill31337/deepseek-team.git
 cd deepseek-team
-python3 install.py
+python3 install.py --with-sandbox
 export PATH="$HOME/.local/bin:$PATH"
+deepseek-team sandbox status
+```
+
+`--with-sandbox` is an **explicit privileged setup path**. On Ubuntu it installs the `bubblewrap` and `apparmor` packages, installs/reloads the package-owned named profile `deepseek-team-bwrap`, and probes the resulting sandbox. It does **not** disable AppArmor and does **not** change `kernel.apparmor_restrict_unprivileged_userns`.
+
+Then configure whichever coordinator(s) you use:
+
+```bash
+# Codex only
+deepseek-team setup --runtime codex
+deepseek-team doctor --runtime codex --offline
+deepseek-team init --coordinator codex
+
+# Claude Code only
+deepseek-team setup --runtime claude
+deepseek-team doctor --runtime claude --offline
+deepseek-team init --coordinator claude
+
+# Or both
+deepseek-team setup --runtime both
+deepseek-team doctor --runtime both --offline
+deepseek-team init --coordinator both
 ```
 
 The installer creates a dedicated venv at `~/.local/share/codex-deepseek-team/venv` and publishes two equivalent commands:
@@ -24,45 +46,92 @@ deepseek-team
 codex-deepseek-team   # legacy compatibility alias
 ```
 
-It refuses to overwrite foreign commands. Custom locations are supported with `python3 install.py --prefix ... --bin-dir ...`. You can alternatively use `pipx install .` or install the checkout into your own venv.
+The legacy Python distribution/namespace is intentionally preserved so existing installations and automation continue to work.
 
-## Choose coordinator support
+### Rootless/manual install
 
-### Codex
-
-```bash
-deepseek-team setup --runtime codex
-deepseek-team doctor --runtime codex --offline
-deepseek-team init --coordinator codex
-```
-
-`setup` adds only the DeepSeek provider block to `${CODEX_HOME:-~/.codex}/config.toml`. It does not change the primary Codex model/provider or OpenAI authentication. Existing compatible DeepSeek settings are reused; conflicting settings are refused. Private backups are stored under `codex-deepseek-team-backups` in the Codex home.
-
-### Claude Code
+Plain installation never invokes `sudo`:
 
 ```bash
-deepseek-team setup --runtime claude
-deepseek-team doctor --runtime claude --offline
-deepseek-team init --coordinator claude
+python3 install.py
+export PATH="$HOME/.local/bin:$PATH"
+deepseek-team sandbox status
 ```
 
-Claude Code needs **no persistent provider modification**. Each worker gets a temporary HOME and an isolated DeepSeek Anthropic-compatible environment. Parent Claude authentication, OAuth and user configuration are not copied into the worker environment.
-
-### Both
+If `sandbox status` succeeds, no AppArmor change is needed. If Ubuntu blocks Bubblewrap while `kernel.apparmor_restrict_unprivileged_userns=1`, install the package profile explicitly:
 
 ```bash
-deepseek-team setup --runtime both
-deepseek-team doctor --runtime both --offline
-deepseek-team init --coordinator both
+deepseek-team sandbox install-apparmor
+deepseek-team sandbox status
 ```
 
-`init` manages a marked block in the coordinator-native instruction files:
+or rerun `python3 install.py --with-sandbox`.
 
-- Codex: `AGENTS.md`
-- Claude Code: `CLAUDE.md`
-- `both`: both files
+On other Linux distributions, install Bubblewrap using the distribution package manager and run `deepseek-team sandbox status`. The package-managed AppArmor profile is specifically intended for Ubuntu/AppArmor user-namespace mediation.
 
-Existing bytes outside the managed block and file permissions are preserved. Duplicate/malformed blocks and symbolic-link targets are refused. Re-run `init` after package updates to refresh only the managed block.
+**Do not solve Ubuntu failures with** `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. DeepSeek Team intentionally keeps the host restriction enabled and grants user-namespace creation only through its named AppArmor path when that fallback is needed.
+
+You can alternatively use `pipx install .` or a venv, but you still need a working system Bubblewrap backend before workers run.
+
+## Why AppArmor + Bubblewrap
+
+Ubuntu can deny unprivileged applications access to user namespaces unless an AppArmor profile explicitly permits them. DeepSeek Team therefore ships this **named, non-attached** profile:
+
+```text
+profile deepseek-team-bwrap flags=(unconfined) {
+  userns,
+}
+```
+
+It is selected explicitly with `aa-exec -p deepseek-team-bwrap -- ...`. The profile does not attach globally to `/usr/bin/bwrap`, so it avoids replacing or competing with distribution/administrator profiles. Its job is only to permit creation of the initial user namespace; **Bubblewrap defines the actual filesystem/process sandbox policy**.
+
+Worker startup is fail-closed by default:
+
+1. locate `bwrap` and verify the required options;
+2. try a direct user-namespace probe;
+3. if Ubuntu AppArmor blocks direct Bubblewrap and the restriction is active, retry through `aa-exec -p deepseek-team-bwrap`;
+4. if neither path works, stop **before reading the DeepSeek credential**.
+
+There is no automatic unsandboxed fallback.
+
+## Codex and Claude use Bubblewrap differently
+
+DeepSeek Team deliberately does **not** put both coordinator CLIs inside the same outer namespace.
+
+### Codex worker
+
+Current Codex on Linux already has its own Bubblewrap-backed `read-only` / `workspace-write` sandbox. Nesting Codex inside another Bubblewrap namespace with further user-namespace creation disabled would break that native sandbox.
+
+DeepSeek Team therefore:
+
+- probes a usable system/AppArmor-aware Bubblewrap backend before worker credentials are read;
+- creates a private temporary `bwrap` shim inside the worker session;
+- puts that shim first on the worker `PATH`;
+- lets **Codex itself** build its normal Linux sandbox using that verified `bwrap` path;
+- retains the existing Codex `read-only` / `workspace-write` policy and writer network restrictions;
+- runs the shared Git `WriteScope` verifier before accepting a writer result.
+
+The parent Codex auth/history/rules/plugins/apps/memories are not copied; the worker receives a temporary `HOME`/`CODEX_HOME` and only the DeepSeek provider configuration it needs.
+
+### Claude Code worker
+
+Claude Code does not provide the same native Linux Bubblewrap boundary for these built-in file tools, so DeepSeek Team puts the entire isolated Claude worker harness inside an **outer Bubblewrap namespace**:
+
+- read-only root filesystem;
+- fresh process/user/IPC/UTS namespaces;
+- dropped capabilities;
+- private `/tmp` and `/var/tmp`;
+- real user HOME masked, with only runtime roots needed to start the CLI re-exposed read-only;
+- common credential stores masked again after runtime mounts;
+- temporary worker HOME writable;
+- repository/worktree mounted read-only for review or read-write for writer mode;
+- `--disable-userns` prevents the worker payload from creating another user namespace.
+
+Claude itself still runs `--bare`, with no session persistence. Built-in tools are restricted to `Read,Glob,Grep` for review and `Read,Glob,Grep,Edit,Write` for writer work; Bash, web tools and agents are absent, MCP tools are explicitly denied, and writer approval rules are path-scoped `Edit(./exact/file)` entries.
+
+### Network boundary
+
+The coordinator CLI must reach the DeepSeek API, so the outer Claude Bubblewrap policy intentionally **does not unshare the network namespace**. This release does not claim network isolation. Network-facing model tools remain excluded by the Claude tool surface, while Codex keeps its own sandbox/network policy.
 
 ## DeepSeek credential
 
@@ -73,11 +142,27 @@ deepseek-team auth set       # hidden terminal prompt
 deepseek-team auth status    # availability only
 ```
 
-The saved key is `~/.config/codex-deepseek/api-key` with directory mode `700` and file mode `600`. `DEEPSEEK_API_KEY` overrides it. For automation, pipe a secret manager to `deepseek-team auth set --stdin`. Never put a key in command arguments, repository files or worker prompts.
+The saved key is `~/.config/codex-deepseek/api-key`, directory mode `700`, file mode `600`. `DEEPSEEK_API_KEY` overrides it. For automation, pipe a secret manager to `deepseek-team auth set --stdin`. Never put a key in command arguments, repository files or worker prompts.
+
+## Project integration
+
+`init` manages one marked instruction block in the coordinator-native file:
+
+- Codex: `AGENTS.md`
+- Claude Code: `CLAUDE.md`
+- `--coordinator both`: both files
+
+Existing bytes outside the managed block and file permissions are preserved. Managed instructions require the OS sandbox and explicitly tell coordinators **not** to add `--os-sandbox off`; if the sandbox is unavailable, fix it or continue locally.
+
+Re-run `init` after package upgrades to refresh the managed block:
+
+```bash
+deepseek-team init --coordinator both /path/to/project
+```
 
 ## Read-only delegation
 
-Codex runtime:
+Codex:
 
 ```bash
 deepseek-team worker --runtime codex <<'TASK'
@@ -87,7 +172,7 @@ Return concise evidence, suggested fix, risks and tests.
 TASK
 ```
 
-Claude Code runtime:
+Claude Code:
 
 ```bash
 deepseek-team worker --runtime claude <<'TASK'
@@ -97,7 +182,7 @@ Return concise evidence, suggested fix, risks and tests.
 TASK
 ```
 
-`--runtime auto` prefers Codex when both CLIs are available, otherwise Claude Code. Coordinator-managed instructions always use an explicit runtime so behavior cannot silently switch.
+`--runtime auto` prefers Codex when both CLIs are available, otherwise Claude Code. Package-managed instructions use an explicit runtime so coordinator behavior does not silently switch.
 
 ## Delegate code creation/editing
 
@@ -116,69 +201,68 @@ Return a brief summary, risks and suggested checks.
 TASK
 ```
 
-The same flow works with `--runtime codex`.
+The same writer flow works with `--runtime codex`.
 
-The writer gets one attempt, one owner per file, exact allowed paths, a per-worktree lock and post-run Git verification. Hidden/credential targets, symlinks, hardlinks, unsafe index state and unsupported Git filter/submodule configurations are rejected. The verifier checks tracked, untracked and ignored changes plus index, HEAD, branch and the linked-worktree Git pointer. Failed/rejected runs can leave partial work for coordinator inspection; they are never silently reset.
+The writer gets one attempt, one owner per file, exact allowed paths, a per-worktree lock and post-run Git verification. Hidden/credential targets, symlinks, hardlinks, unsafe index state and unsupported Git filter/submodule configurations are rejected. The verifier checks tracked, untracked and ignored changes plus index, HEAD, branch and the linked-worktree Git pointer. Failed/rejected runs may leave partial work for coordinator inspection; DeepSeek Team never silently resets it.
 
 **The coordinator must inspect the actual diff/new files, run meaningful tests, and integrate.** Workers never stage, commit, push or deploy. Writers never retry automatically after partial edits.
 
-## Runtime isolation
+## Sandbox commands
 
-### Codex worker
+```bash
+deepseek-team sandbox status
+deepseek-team sandbox install-apparmor
+deepseek-team sandbox remove-apparmor
+```
 
-- Uses provider `deepseek`, model `deepseek-flash`, DeepSeek Responses API.
-- Runs a separate ephemeral Codex process with a temporary `CODEX_HOME`.
-- Parent Codex auth/history/rules/plugins/apps/memories are not copied.
-- Read-only mode uses the Codex read-only sandbox.
-- Writer mode uses `workspace-write` with worker network access disabled, then the shared Git allowlist verifier checks the result.
+`install-apparmor` refuses to overwrite a different/symlinked/non-file `/etc/apparmor.d/deepseek-team-bwrap`. `remove-apparmor` removes the policy only when its installed bytes still exactly match the package copy; administrator-modified policy is preserved.
 
-### Claude Code worker
+For diagnosis only, workers accept:
 
-- Uses DeepSeek's Anthropic-compatible endpoint in a separate Claude Code process.
-- Uses DeepSeek's current Claude integration mapping `deepseek-flash[1m]` with max effort; DeepSeek currently serves V4.1 Flash.
-- Runs `--bare`, print mode, JSON output and no session persistence with a temporary HOME.
-- Parent Anthropic API keys/OAuth are not inherited; only the DeepSeek worker token is supplied to the child API client.
-- Built-in tool availability is restricted to `Read,Glob,Grep` for review and `Read,Glob,Grep,Edit,Write` for writer work. Bash, web tools and agents are absent from the tool surface; MCP tools are explicitly denied.
-- Read-only workers do **not** globally pre-approve `Read`; normal in-worktree reads can proceed while permission-requiring access falls into `dontAsk` and is denied.
-- Writers pre-approve only path-scoped `Edit(./exact/file)` rules derived from each `--allow-write` entry. Claude Code applies `Edit(path)` permissions to its built-in write tools as well. Git verification remains the final acceptance boundary.
+```bash
+deepseek-team worker --os-sandbox off ...
+```
 
-The package does not claim to be an OS/container confidentiality boundary. Do not delegate repositories containing readable secrets or unrelated private data; use a separate OS user/container when stronger host isolation is required. The exact writer allowlist is both permission-scoped (Claude runtime) and verified after execution, but post-run verification cannot undo arbitrary hostile side effects outside the repository.
+This prints a warning and deliberately bypasses the new OS-layer requirement. It is **not** used by managed project instructions and should not be used as a fix for a broken production setup.
 
-## Reliability
+## Reliability and security boundaries
 
 - At most three workers share user-level locks; writer work also has a per-worktree lock.
-- Default overall timeout is `0` (unlimited). A slow/silent worker is not treated as failed.
+- Default total timeout is `0` (unlimited). A slow/silent worker is not treated as failed.
 - Read-only transient failures can retry within the configured bounded attempt count. Writers use exactly one attempt.
-- Worker output must be a completed structured result. Malformed JSON, invalid UTF-8, terminal failure events and empty successful answers are rejected without publishing a candidate answer.
+- Worker output must be a completed structured result. Malformed JSON, invalid UTF-8, terminal failure events and empty successful answers are rejected.
 - `DEEPSEEK_TEAM_DISABLED=1` disables delegation. `CODEX_DEEPSEEK_DISABLED=1` remains supported for compatibility.
-- DeepSeek/model claims in prompts are treated as requested configuration, not proof of the remote model; `doctor --live` performs the available routing probe.
+- DeepSeek/model names in prompts are requested configuration, not proof of the remotely served model; `doctor --live` performs the available routing probe.
+
+Bubblewrap + AppArmor materially tighten host isolation, but DeepSeek Team is **not a complete confidentiality boundary for arbitrary hostile repositories or coordinator binaries**. The Claude sandbox intentionally exposes the worktree and the runtime files required to start the CLI; Codex relies on Codex's native Bubblewrap policy. If the repository itself contains credentials, the model may be allowed to read them as project files. Use a dedicated OS user/container/VM when stronger isolation is required.
 
 ## Checks
 
 ```bash
+deepseek-team sandbox status
 deepseek-team doctor --runtime codex --offline
 deepseek-team doctor --runtime claude --offline
 deepseek-team doctor --runtime both --offline
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-`--offline` performs no DeepSeek API request and does not validate the key. `doctor --runtime ... --live` makes billable DeepSeek calls, uses a synthetic repository and verifies that the selected read-only runtime does not modify it.
+`doctor --offline` verifies local sandbox/runtime capabilities without a DeepSeek API request or key validation. `doctor --live` makes billable DeepSeek calls, uses a synthetic repository, and verifies that selected read-only workers do not modify it.
 
-Offline tests use synthetic credentials/transports. The GitHub Actions matrix runs the full unittest suite, builds/installs the wheel and exercises both console aliases on Python 3.11, 3.12 and 3.13. Real local CLI protocol tests run only when the corresponding CLI is available; a green synthetic matrix is not evidence of a live provider request.
+Offline tests use synthetic credentials/transports. GitHub Actions runs the full unittest suite, builds/installs the wheel and exercises both console aliases on Python 3.11, 3.12 and 3.13. A separate Ubuntu job attempts a live Bubblewrap/AppArmor capability smoke test; hosted-runner kernel restrictions are reported separately from deterministic unit-test results. A green CI matrix is not evidence of a live DeepSeek inference request.
 
-## Update, disable and remove
+## Update and remove
 
 Installer-managed checkout:
 
 ```bash
 git pull --ff-only
-python3 install.py
-deepseek-team init --coordinator both /path/to/project   # choose codex/claude/both as needed
+python3 install.py --with-sandbox   # recommended on Ubuntu
+deepseek-team init --coordinator both /path/to/project
 ```
 
-For pipx: `pipx upgrade codex-deepseek-team`.
+For pipx: `pipx upgrade codex-deepseek-team`, then run `deepseek-team sandbox status`.
 
-Detach project instructions and package-owned configuration:
+Detach project instructions/package-owned coordinator configuration:
 
 ```bash
 deepseek-team detach --coordinator both /path/to/project
@@ -186,9 +270,15 @@ deepseek-team reset --runtime both
 deepseek-team auth remove       # optional
 ```
 
-`reset --runtime codex` removes only this package's unmodified provider block and preserves primary auth/model and unrelated providers. Claude runtime has no package-owned persistent provider config, so resetting Claude is intentionally a no-op. Environment keys and private Codex config backups are retained.
+If you also want to remove only the unchanged package-owned AppArmor policy:
 
-Uninstall with your package manager, or remove the installer-owned `~/.local/bin/deepseek-team`, `~/.local/bin/codex-deepseek-team` symlinks and `~/.local/share/codex-deepseek-team` directory after detaching projects.
+```bash
+deepseek-team sandbox remove-apparmor
+```
+
+`reset --runtime codex` removes only this package's unmodified DeepSeek provider block and preserves primary auth/model and unrelated providers. Claude runtime has no package-owned persistent provider config, so resetting Claude is a no-op. Environment keys and private Codex config backups are retained.
+
+Uninstall the Python package with your package manager, or remove the installer-owned `~/.local/bin/deepseek-team`, `~/.local/bin/codex-deepseek-team` symlinks and `~/.local/share/codex-deepseek-team` directory after detaching projects.
 
 ## Scope
 
