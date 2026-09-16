@@ -2,22 +2,27 @@
 
 ## Goal
 
-Add a Linux OS-level containment layer around every DeepSeek worker process, with first-class Ubuntu AppArmor support, without weakening the existing Codex/Claude runtime restrictions or Git writer verification.
+Add a fail-closed Linux OS isolation layer to DeepSeek workers with first-class Ubuntu AppArmor support, while preserving the coordinator-native sandbox architecture of both Codex and Claude Code and the shared Git writer verifier.
 
 ## Security model
 
-`deepseek-team worker` runs the selected Codex or Claude Code harness inside Bubblewrap (`bwrap`) by default. Bubblewrap is a second containment boundary around the existing runtime-specific controls:
+The OS layer is **hybrid**, because current Codex on Linux already creates its own Bubblewrap/user-namespace sandbox:
 
-- Codex keeps its own `read-only` / `workspace-write` sandbox and DeepSeek provider configuration.
-- Claude Code keeps `--bare`, restricted built-in tools, path-scoped writer permissions, no Bash/web/agents, and explicit MCP denial.
-- `WriteScope` remains authoritative for accepting writer results and still verifies HEAD, branch, index and changed paths after execution.
-- Bubblewrap adds mount/process/user/IPC/UTS isolation, drops capabilities, creates private temporary directories and hides the real user home from the worker except for the minimum runtime paths needed to start the selected CLI.
+- **Codex runtime:** keep Codex `read-only` / `workspace-write` as the actual process/filesystem sandbox. DeepSeek Team first probes a known-working `bwrap` backend, then places a private `bwrap` shim at the front of the temporary worker `PATH`. The shim invokes either the probed system `bwrap` directly or `aa-exec -p deepseek-team-bwrap -- bwrap`. This makes Codex's own native sandbox use the verified/AppArmor-aware executable without nesting Codex inside another user namespace.
+- **Claude Code runtime:** run the whole isolated `--bare` Claude harness inside an outer DeepSeek Team Bubblewrap namespace. Claude keeps its restricted built-in tools, path-scoped writer permissions, no Bash/web/agents and explicit MCP denial.
+- **Both runtimes:** `WriteScope` remains the result-acceptance boundary for writer work and still verifies HEAD, branch, index and changed paths after execution.
 
-The outer Bubblewrap layer must not silently disappear. Worker execution is fail-closed by default when a usable Bubblewrap sandbox cannot be created. A deliberately explicit `--os-sandbox off` escape hatch remains available for diagnosis/legacy environments and prints a warning; coordinator-managed instructions never use it.
+A usable Bubblewrap backend is required before the DeepSeek credential is read. There is no automatic unsandboxed fallback. `--os-sandbox off` is an explicit unsafe compatibility/diagnostic escape hatch and prints a warning; package-managed coordinator instructions never use it.
 
-## Bubblewrap layout
+## Why Codex is not outer-wrapped
 
-The worker child is launched with a command equivalent to:
+Putting current Codex inside an outer `bwrap --disable-userns` would block Codex from constructing its own inner Linux sandbox. Allowing arbitrary nested user namespaces just to make double-bwrap work would weaken the intended boundary. Therefore DeepSeek Team verifies and supplies the `bwrap` path that Codex itself uses rather than wrapping Codex a second time.
+
+This preserves Codex's native sandbox semantics and avoids a second namespace layer whose behavior could drift from Codex releases.
+
+## Claude Bubblewrap layout
+
+The Claude worker harness uses:
 
 - `--die-with-parent`
 - `--new-session`
@@ -28,86 +33,87 @@ The worker child is launched with a command equivalent to:
 - `--unshare-cgroup-try` when supported
 - `--disable-userns`
 - `--cap-drop ALL`
-- root filesystem mounted read-only
-- a fresh `/proc`
-- a minimal `/dev`
-- private tmpfs mounts for `/tmp` and `/var/tmp`
-- the per-worker temporary HOME mounted read-write
-- the current repository/worktree mounted read-only for research/review and read-write for writer mode
-- the real user HOME hidden by tmpfs; only runtime roots required by the resolved coordinator executable/PATH are re-exposed read-only, followed by explicit masks for common credential stores
+- read-only root filesystem
+- fresh `/proc` and minimal `/dev`
+- private tmpfs `/tmp` and `/var/tmp`
+- temporary worker HOME read-write
+- repository/worktree read-only for review and read-write for writer mode
+- real user HOME masked by tmpfs; only top-level runtime roots needed by the resolved executable/PATH are re-exposed read-only, followed by explicit masks for common credential stores
 
-The runtime API client still needs outbound network access to reach DeepSeek. Therefore the outer Bubblewrap layer intentionally keeps the host network namespace. Network capability for model tools remains controlled by the existing harness rules: Claude exposes no Bash/web tools, and Codex keeps its own sandbox network restrictions. Documentation must not claim that Bubblewrap provides network isolation.
+Bubblewrap resolves bind sources from its preserved host root, so a host path can be re-exposed after the visible HOME has been replaced by tmpfs.
+
+The Claude API client must still reach DeepSeek. The outer sandbox therefore intentionally keeps the host network namespace. This feature **does not claim network isolation**; model-facing network capability remains denied by the Claude tool surface and Codex's own sandbox rules.
 
 ## Ubuntu AppArmor integration
 
-Ubuntu 24.04+ enables AppArmor mediation of unprivileged user namespace creation by default. Globally setting `kernel.apparmor_restrict_unprivileged_userns=0` is forbidden by this package.
+Ubuntu 24.04+ can mediate unprivileged user namespace creation through AppArmor. DeepSeek Team never disables `kernel.apparmor_restrict_unprivileged_userns` globally.
 
-To avoid collisions with distribution or third-party `/usr/bin/bwrap` attachment profiles, DeepSeek Team ships a named profile `deepseek-team-bwrap` rather than a global `profile ... /usr/bin/bwrap` attachment. The profile is selected only for our Bubblewrap invocation through:
+To avoid collisions with distro or third-party profiles attached directly to `/usr/bin/bwrap`, the package ships a named profile with no executable attachment:
+
+```text
+profile deepseek-team-bwrap flags=(unconfined) {
+  userns,
+}
+```
+
+The profile is selected only for our Bubblewrap path through:
 
 ```text
 aa-exec -p deepseek-team-bwrap -- /usr/bin/bwrap ...
 ```
 
-The profile itself is intentionally narrow in purpose: it is unconfined for ordinary resources and grants `userns` so Bubblewrap can construct the namespace. The actual sandbox restriction comes from Bubblewrap. `--disable-userns` prevents the worker payload from creating further user namespaces after setup.
+The AppArmor profile's narrow role is to permit the initial user namespace on hosts where the Ubuntu restriction blocks direct Bubblewrap. Bubblewrap itself supplies the mount/process/capability sandbox. For the outer Claude sandbox, `--disable-userns` prevents the payload from creating further user namespaces. For Codex, the same AppArmor-aware bwrap shim is used by Codex's own native sandbox.
 
-Runtime selection is capability based:
+Backend selection is capability based:
 
-1. Probe direct `bwrap` first. If it works, use it and do not interfere with existing distro policy.
-2. If direct `bwrap` is blocked and AppArmor unprivileged-userns restriction is active, probe the package named profile through `aa-exec`.
-3. If neither path works, fail closed and print remediation instructions.
+1. Find `bwrap`, verify the required options, and probe direct namespace creation.
+2. If direct bwrap is blocked and `kernel.apparmor_restrict_unprivileged_userns=1`, probe the named profile through `aa-exec`.
+3. If neither path works, fail closed with remediation instructions.
 
-This avoids overwriting or disabling Ubuntu's own `bwrap-userns-restrict` policy and avoids changing global sysctls.
+No distro `/usr/bin/bwrap` profile is overwritten and no global sysctl is changed.
 
 ## System setup and removal
 
-A new sandbox helper module owns probing, command construction and AppArmor lifecycle operations.
+`sandbox.py` owns probing, Claude command wrapping, the Codex bwrap shim, and conservative AppArmor lifecycle operations.
 
-`deepseek-team sandbox status` reports:
+`deepseek-team sandbox status` reports the selected bwrap path/backend and the AppArmor userns restriction value when available. It never reads or displays provider credentials.
 
-- Bubblewrap path/version and required option support;
-- `kernel.apparmor_restrict_unprivileged_userns` when present;
-- whether direct Bubblewrap works;
-- whether the package AppArmor profile path works through `aa-exec`;
-- the effective backend selected for workers.
+`deepseek-team sandbox install-apparmor` installs/reloads only the exact package-owned profile using `apparmor_parser -r`. A symlink, non-file, or different existing policy is refused.
 
-`deepseek-team sandbox install-apparmor` installs only the package-owned profile and loads it with `apparmor_parser -r`. It may invoke `sudo`; it refuses to replace an existing different profile file.
+`deepseek-team sandbox remove-apparmor` unloads/removes only an installed file whose bytes still exactly match the packaged profile. Administrator-modified policy is never deleted automatically.
 
-`deepseek-team sandbox remove-apparmor` unloads/removes only a byte-for-byte package-owned profile and refuses to remove modified administrator policy.
-
-On Ubuntu, `python3 install.py --with-sandbox` additionally ensures the required system packages are present and installs/loads the named profile. Plain `python3 install.py` remains non-root and package-only, but prints a clear sandbox remediation when the required worker sandbox is not usable.
+On Ubuntu, `python3 install.py --with-sandbox` explicitly installs the `bubblewrap` and `apparmor` packages via `sudo apt-get install -y`, installs the named profile, then runs `sandbox status`. Plain `python3 install.py` remains rootless and never invokes sudo; workers remain fail-closed until `sandbox status` succeeds.
 
 ## Compatibility
 
 - Linux and Python 3.11+ remain required.
-- Codex and Claude Code runtime interfaces remain unchanged.
-- Existing credential locations, environment switches and the legacy `codex-deepseek-team` command remain compatible.
-- The release version becomes `0.3.0` because worker execution now has a new mandatory outer sandbox by default.
+- Existing Codex/Claude runtime selection and coordinator instruction files remain compatible.
+- Existing credential locations, environment switches, Python distribution name/namespace, and legacy `codex-deepseek-team` CLI remain compatible.
+- Version becomes `0.3.0` because a usable OS sandbox is now required by default.
 - No Python runtime dependency is added; Bubblewrap/AppArmor are system dependencies.
-- Non-Ubuntu Linux can use direct Bubblewrap without AppArmor-specific installation.
+- Non-Ubuntu Linux can use a directly working Bubblewrap without the package AppArmor profile.
 
 ## Error handling
 
-Sandbox setup errors must never include environment values or raw provider output. Worker execution must stop before reading the DeepSeek credential when required OS isolation is unavailable. Timeouts/cancellation must continue to kill the whole process group, including `aa-exec`/`bwrap` and the coordinator CLI.
+Sandbox setup failures contain no environment values or raw provider output. Required containment is resolved before the DeepSeek credential is read. Timeouts and cancellation still terminate the whole launched process group.
 
-System installation is conservative: no global sysctl edits, no replacement of foreign AppArmor profiles, no automatic deletion of modified policy, and no fallback from a requested secure worker to unsandboxed execution.
+The system setup path is conservative: no global sysctl edits, no replacement of foreign AppArmor profiles, no automatic removal of modified policy, and no silent fallback to unsandboxed workers.
 
 ## Testing
 
-Regression-first tests cover:
+Regression coverage includes:
 
-- direct Bubblewrap backend selection;
-- AppArmor `aa-exec` fallback selection;
-- fail-closed behavior when neither works;
-- required Bubblewrap flags and read-only/read-write worktree mounting;
-- real HOME masking and temporary HOME binding;
-- runtime paths under HOME re-exposed read-only;
-- credential-store masks ordered after runtime mounts;
-- worker stopping before key reads when sandbox setup fails;
-- both Codex and Claude commands wrapped identically by the outer sandbox;
-- installer `--with-sandbox` behavior through mocked privileged commands;
-- AppArmor install/remove refusal for foreign or modified files;
-- package data includes the AppArmor profile;
-- doctor/sandbox status output does not expose credentials;
-- full existing 0.2 regression suite remains green.
+- direct Bubblewrap and AppArmor-fallback selection;
+- required feature probing and fail-closed behavior;
+- Claude read-only/read-write worktree mount modes;
+- real HOME masking, temporary HOME binding, runtime-root re-exposure and credential-store masks;
+- private direct/AppArmor Codex `bwrap` shims;
+- worker sandbox resolution before API-key reads;
+- outer Claude wrapping versus native Codex sandbox preparation;
+- `--os-sandbox off` as an explicit-only bypass;
+- AppArmor install/remove refusal for foreign, symlinked or modified policy;
+- `sandbox` CLI, doctor propagation and Ubuntu installer flow;
+- package data containing the profile;
+- the complete pre-0.3 regression suite.
 
-CI additionally performs a Bubblewrap smoke test on Ubuntu when the runner supports unprivileged user namespaces; the deterministic unit tests remain authoritative when a hosted kernel does not expose AppArmor/userns capabilities.
+CI keeps deterministic unit coverage on Python 3.11-3.13 and adds an Ubuntu Bubblewrap/AppArmor smoke attempt. Hosted-kernel limitations must be reported explicitly rather than represented as proof of enforcement.
