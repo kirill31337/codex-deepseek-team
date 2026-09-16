@@ -181,8 +181,8 @@ class WriteTests(unittest.TestCase):
         standalone = self.root / 'standalone' / 'worker.py'
         standalone.parent.mkdir()
         shutil.copyfile(base.SOURCE, standalone)
-        command = [sys.executable, str(standalone), '--codex', str(self.root / 'codex-ok'),
-                   '--state-dir', str(self.state)]
+        command = [sys.executable, str(standalone), '--os-sandbox', 'off',
+                   '--codex', str(self.root / 'codex-ok'), '--state-dir', str(self.state)]
         r = subprocess.run(command, input='read-only works', text=True, capture_output=True,
                            cwd=self.repo, env=self.env, timeout=15)
         self.assertEqual(r.returncode, 0, r.stderr)
