@@ -71,7 +71,7 @@ class ClaudeRuntimeTests(unittest.TestCase):
 
     def run_worker(self, mode='ok', task='claude task', extra=()):
         return subprocess.run(
-            [sys.executable, str(SOURCE), '--runtime', 'claude',
+            [sys.executable, str(SOURCE), '--runtime', 'claude', '--os-sandbox', 'off',
              '--claude', str(self.root / f'claude-{mode}'),
              '--state-dir', str(self.state), *extra],
             input=task, text=True, capture_output=True, env=self.env,
