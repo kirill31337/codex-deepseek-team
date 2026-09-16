@@ -1,26 +1,48 @@
-# Version 0.2.0 verification
+# Version 0.3.0 verification
 
-Date: 2026-09-15. Release scope: Linux, Python 3.11+, Codex CLI and/or Claude Code CLI coordinating DeepSeek workers.
+Date: 2026-09-16. Release scope: Linux, Python 3.11+, Codex CLI and/or Claude Code CLI coordinating DeepSeek workers with required Bubblewrap/AppArmor-aware OS isolation.
 
 ## Completed checks
 
-- Development followed regression-first cycles for the new Claude runtime, coordinator-native instruction files, universal CLI/packaging, path-scoped Claude writer permissions and the final `--disallowedTools` capability check. Each new behavior was observed failing before its production change.
-- The GitHub Actions matrix runs `PYTHONPATH=src python -m unittest discover -s tests -v` on Python 3.11, 3.12 and 3.13. The final suite contains **128 tests**; two real-Codex protocol tests are skipped on the hosted runner because Codex CLI is not installed there. The remaining synthetic/runtime/Git tests run on every matrix member.
-- The matrix builds the 0.2.0 source distribution and `py3-none-any` wheel, installs the wheel, and executes both installed entry points: `codex-deepseek-team --version` and `deepseek-team --version`.
-- Existing Codex regression coverage remains in place for provider routing, temporary `CODEX_HOME`, credential isolation/redaction, malformed output handling, bounded read-only retries, unlimited default wait, cancellation, process-group cleanup, read-only/write sandbox configuration and writer result verification.
-- Claude runtime tests use a fake Claude Code subprocess and verify the actual child argv/environment boundary: temporary HOME, DeepSeek Anthropic-compatible endpoint, no inherited Anthropic/OAuth/DeepSeek environment credentials, `--bare`, no session persistence, JSON result handling, restricted built-in tools, explicit MCP denial and failure-result suppression.
-- Claude writer tests verify that only exact path-scoped `Edit(./file)` permission rules are pre-approved for `--allow-write` targets; read-only mode does not globally pre-approve `Read`. Unsafe permission-rule paths are rejected before inference.
-- Coordinator tests verify reversible, byte-preserving managed blocks in `AGENTS.md`, `CLAUDE.md`, or both, including existing file modes and legacy Codex defaults.
-- Real Git tests verify clean linked-worktree admission for both `codex/` and `deepseek/` branches, exact post-run file allowlists, ignored/untracked changes, Git index/HEAD/branch integrity, symlink/hardlink rejection, `assume-unchanged`/`skip-worktree` defenses, file-mode changes, filesystem-monitor suppression, external clean/process filter refusal and Git-pointer protection.
-- Installer tests verify publication and repeat upgrades of both console aliases without overwriting foreign commands or foreign installation prefixes.
-- Offline `doctor` tests verify Codex and Claude capability surfaces independently. Claude-only setup/doctor does not require or modify Codex configuration; `both` preserves the primary Codex model/provider and only manages the package-owned DeepSeek provider block.
+- Development used regression-first cycles for the Bubblewrap/AppArmor capability layer, worker integration, sandbox CLI/doctor/installer flow, and release metadata. The new contracts were observed failing before their production implementations: the first sandbox test failed only because the module did not exist; the worker integration phase then failed only the five new OS-sandbox tests; the CLI/doctor/installer phase then failed only the eight new interface tests; the release phase failed only the expected version/instruction assertions.
+- GitHub Actions run **35120529930** on candidate `deb4d000569b9c452c95c89339d2d82aa0a31bb8` completed successfully on Python **3.11, 3.12 and 3.13** plus the dedicated Ubuntu 24.04 sandbox smoke job.
+- The final suite at that gate contains **158 tests**. On Python 3.11 it reported `Ran 158 tests` and `OK (skipped=2)`. The two skips are the pre-existing real-Codex protocol tests because Codex CLI is not installed in the hosted matrix job; all other synthetic/runtime/Git/AppArmor tests ran.
+- The Python matrix built both `codex_deepseek_team-0.3.0.tar.gz` and `codex_deepseek_team-0.3.0-py3-none-any.whl`, installed the wheel, and executed both console aliases successfully. `codex-deepseek-team --version` and `deepseek-team --version` both printed `deepseek-team 0.3.0`.
+- Build logs confirm the packaged wheel and sdist contain `codex_deepseek_team/data/apparmor/deepseek-team-bwrap` and the new `sandbox.py` module.
+- The sandbox unit suite verifies direct Bubblewrap selection, AppArmor fallback selection, fail-closed behavior, required Bubblewrap feature checks, Claude read-only/read-write mount modes, real-HOME masking, temporary-HOME binding, credential-store masking, refusal to expose the entire real HOME as a checkout, private Codex bwrap shims, and conservative AppArmor install/remove semantics.
+- Worker integration tests verify that required OS isolation is resolved before the DeepSeek credential is read; Claude commands are outer-wrapped in Bubblewrap; Claude writer mode exposes the worktree read-write only for the isolated writer; and Codex keeps its native sandbox while receiving a private verified/AppArmor-aware `bwrap` shim through the temporary worker PATH.
+- Sandbox CLI tests verify `status`, `install-apparmor`, and `remove-apparmor`; safe error mapping; doctor ordering and policy propagation; and that status output does not expose provider credentials. Installer tests verify `--with-sandbox` is explicit, Ubuntu-specific, and invokes system setup only when requested, while a plain install never invokes `sudo` or AppArmor lifecycle commands.
+- Managed coordinator tests verify both `AGENTS.md` and `CLAUDE.md` instruct coordinators to keep the OS sandbox enabled and never add `--os-sandbox off` to normal worker commands.
+- Existing 0.2 regression coverage remains in place for Codex provider routing, temporary coordinator homes, credential isolation/redaction, malformed-output rejection, retry/cancellation behavior, Claude `--bare` tool restrictions and path-scoped writer permissions, exact Git allowlists, index/HEAD/branch integrity, symlink/hardlink defenses, filter/fsmonitor/index-flag hardening and reversible project instructions.
+
+## Live Ubuntu AppArmor + Bubblewrap smoke
+
+A dedicated `ubuntu-24.04` GitHub Actions job ran against Ubuntu **24.04.5** with the distribution packages installed by APT. The observed packages included Bubblewrap **0.9.0-1ubuntu0.1** and AppArmor **4.0.1really4.0.1-0ubuntu0.24.04.4**.
+
+The hosted Ubuntu environment reported:
+
+```text
+kernel.apparmor_restrict_unprivileged_userns = 1
+```
+
+The smoke job then completed all of the following successfully:
+
+1. `apparmor_parser -Q -K src/codex_deepseek_team/data/apparmor/deepseek-team-bwrap` — packaged profile syntax compiled without kernel load or cache writes.
+2. `deepseek-team sandbox install-apparmor` — the named profile was installed and loaded.
+3. `deepseek-team sandbox status` — selected the **apparmor** backend and reported `/usr/bin/bwrap`, `kernel.apparmor_restrict_unprivileged_userns=1`, and `deepseek-team-bwrap` selected through `aa-exec`.
+4. An explicit `aa-exec -p deepseek-team-bwrap -- bwrap ... /usr/bin/true` user-namespace/process sandbox probe completed successfully.
+
+This is real evidence that the packaged named profile permits Bubblewrap on an Ubuntu 24.04 hosted kernel while the AppArmor unprivileged-userns restriction remains enabled. It is not a claim that every Ubuntu kernel or local administrator policy is identical; `deepseek-team sandbox status` remains the host-specific gate.
 
 ## Deliberate limits
 
-- This release remains **Linux-only**. Windows support is intentionally deferred rather than weakening the writer/process/file-safety guarantees.
-- The 0.2.0 work did **not** make a live DeepSeek API request and did not execute a real Claude Code or Codex CLI binary in GitHub Actions. Claude protocol tests use a faithful synthetic CLI boundary; the two tests that require a real Codex CLI are explicitly skipped when it is absent. Use `deepseek-team doctor --runtime <codex|claude|both> --live` on the target host for billable end-to-end validation.
-- Claude file permissions are an inner boundary and the shared Git verifier is the acceptance boundary. Post-run verification cannot undo arbitrary hostile side effects outside the repository, and this package is not a replacement for an OS user/container confidentiality boundary.
-- Codex writer mode still relies on Codex `workspace-write` sandbox behavior plus the shared verifier. Claude writer mode deliberately exposes no Bash/web/agent tools and denies MCP tools, but readable source inside the working environment should still be treated as available to the model.
-- The exact writer allowlist permits source creation/editing only in a clean dedicated linked worktree. Rejected or partial changes are preserved for coordinator inspection; writers never automatically retry, stage, commit, push or deploy.
+- This release remains **Linux-only**. Windows support is intentionally deferred rather than weakening the process/filesystem/writer guarantees.
+- The 0.3.0 work did **not** make a billable live DeepSeek inference request and did not execute a real Claude Code or Codex CLI binary in the release matrix. The two tests requiring a real Codex CLI are explicitly skipped when Codex is absent; Claude protocol behavior is exercised through a synthetic CLI boundary. Use `deepseek-team doctor --runtime <codex|claude|both> --live` on the target host for end-to-end provider validation.
+- Current Codex source was separately checked during development to confirm that its Linux sandbox uses Bubblewrap and selects a suitable `bwrap` from PATH. The release therefore supplies a private verified/AppArmor-aware bwrap shim to Codex instead of nesting Codex inside another user namespace. This compatibility point should be re-verified if upstream Codex changes its Linux sandbox architecture.
+- The outer Claude Bubblewrap sandbox intentionally keeps the host network namespace because the coordinator CLI must reach the DeepSeek API. The feature does **not** claim network isolation. Claude still exposes no Bash/web/agent tools to the worker and explicitly denies MCP tools.
+- The named AppArmor profile is intentionally unconfined for ordinary resources and grants `userns`; Bubblewrap provides the actual filesystem/process/capability restrictions. DeepSeek Team never disables `kernel.apparmor_restrict_unprivileged_userns` globally and never replaces a different administrator/distro AppArmor policy.
+- Bubblewrap/AppArmor materially strengthen host isolation but do not make arbitrary hostile repositories safe. The worktree is intentionally visible to the worker, and runtime files required to start the coordinator may be re-exposed read-only. Secrets stored inside delegated project content should be treated as readable project data. Use a dedicated OS user/container/VM for a stronger confidentiality boundary.
+- `WriteScope` remains the acceptance boundary for writer output. Rejected or partial changes are preserved for coordinator inspection; writers never automatically retry, stage, commit, push or deploy.
+- `--os-sandbox off` is an explicit unsafe compatibility/diagnostic bypass. Managed project instructions never invoke it, and no automatic fallback to it exists.
 - No speed, token-saving or cost percentage is claimed. Delegation economics depend on task size, supplied context, retries and coordinator review.
 - Keys, parent conversation history, primary coordinator auth and raw provider logs are not part of the repository or distributions.
