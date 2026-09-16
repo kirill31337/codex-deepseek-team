@@ -5,7 +5,9 @@ from dataclasses import dataclass, field
 from importlib import resources
 import os
 from pathlib import Path
+import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 from typing import Callable, Iterable
@@ -119,6 +121,38 @@ def probe_backend(*, which=shutil.which, runner=subprocess.run,
     )
 
 
+def prepare_codex_environment(session_home: Path, env: dict[str, str],
+                              backend: SandboxBackend) -> dict[str, str]:
+    """Force Codex's native Linux sandbox to use exactly the probed bwrap path.
+
+    Codex itself creates the Bubblewrap namespace. Nesting Codex inside another
+    user namespace would break that native sandbox on current Linux builds, so we
+    put a private `bwrap` shim first on PATH instead. On Ubuntu-restricted hosts
+    the shim applies the package named AppArmor profile with aa-exec.
+    """
+    session_home = Path(session_home)
+    wrapper_dir = session_home / '.deepseek-team-bwrap-bin'
+    wrapper = wrapper_dir / 'bwrap'
+    try:
+        wrapper_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
+        command = ' '.join(shlex.quote(part) for part in backend.prefix)
+        payload = '#!/bin/sh\nexec ' + command + ' "$@"\n'
+        fd = os.open(wrapper, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as target:
+            target.write(payload)
+            target.flush()
+            os.fsync(target.fileno())
+        info = wrapper.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+                info.st_uid != os.geteuid() or info.st_mode & 0o077):
+            raise OSError('unsafe private bwrap wrapper')
+    except OSError:
+        raise SandboxError(78, 'Could not create the private Codex bwrap wrapper.') from None
+    result = dict(env)
+    result['PATH'] = str(wrapper_dir) + os.pathsep + result.get('PATH', '')
+    return result
+
+
 def _inside(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -167,22 +201,12 @@ def _runtime_roots(command: list[str], env: dict[str, str], real_home: Path,
     return roots
 
 
-def _masked_by_runtime(path: Path, runtime_roots: list[Path]) -> bool:
-    for root in runtime_roots:
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            continue
-    return False
-
-
 def wrap_command(command: list[str], *, cwd: Path, session_home: Path,
                  writable: bool, env: dict[str, str], backend: SandboxBackend,
                  real_home: Path | None = None,
                  existing: Callable[[Path], bool] | None = None,
                  is_dir: Callable[[Path], bool] | None = None) -> list[str]:
-    """Wrap one coordinator CLI command in a minimal bwrap mount/process sandbox."""
+    """Wrap a Claude Code worker in a minimal bwrap mount/process sandbox."""
     if not command:
         raise SandboxError(64, 'Cannot sandbox an empty worker command.')
     existing = existing or (lambda path: path.exists())
@@ -190,6 +214,8 @@ def wrap_command(command: list[str], *, cwd: Path, session_home: Path,
     cwd = Path(os.path.abspath(cwd))
     session_home = Path(os.path.abspath(session_home))
     real_home = Path(os.path.abspath(real_home or Path.home()))
+    if cwd == real_home:
+        raise SandboxError(78, 'Refusing to expose the entire real HOME as a worker checkout.')
 
     args = [
         *backend.prefix,
