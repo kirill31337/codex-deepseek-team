@@ -96,18 +96,19 @@ class CommandLayoutTests(unittest.TestCase):
                      '--dev', '--tmpfs', '--chdir']:
             self.assertIn(flag, args)
         self.assertNotIn('SECRET_VALUE_MUST_NOT_APPEAR_IN_ARGV', joined)
-        self.assertInSequence = None
-        home_mask = args.index('/home/alice', args.index('--tmpfs'))
+        home_mask = next(i for i in range(len(args) - 1)
+                         if args[i:i + 2] == ['--tmpfs', '/home/alice'])
         runtime_mount = next(i for i in range(home_mask + 1, len(args) - 2)
                              if args[i:i + 3] == ['--ro-bind', '/home/alice/.local', '/home/alice/.local'])
-        worktree_mount = next(i for i in range(runtime_mount + 1, len(args) - 2)
+        session_mount = next(i for i in range(runtime_mount + 1, len(args) - 2)
+                             if args[i:i + 3] == ['--bind', str(session), str(session)])
+        worktree_mount = next(i for i in range(session_mount + 1, len(args) - 2)
                               if args[i:i + 3] == ['--ro-bind', str(cwd), str(cwd)])
         self.assertLess(home_mask, runtime_mount)
-        self.assertLess(runtime_mount, worktree_mount)
-        self.assertInSequence = None
-        self.assertIn('--bind', args)
-        self.assertIn(str(session), args)
-        self.assertEqual(args[-3:], ['--chdir', str(cwd), '/home/alice/.local/bin/claude'] + ['--bare'][-0:])
+        self.assertLess(runtime_mount, session_mount)
+        self.assertLess(session_mount, worktree_mount)
+        self.assertEqual(
+            args[-5:], ['--chdir', str(cwd), '--', '/home/alice/.local/bin/claude', '--bare'])
 
     def test_writer_mounts_only_worktree_as_readwrite_after_readonly_root(self):
         cwd = Path('/srv/project')
