@@ -1,6 +1,7 @@
 """OS sandbox contract for DeepSeek worker subprocesses."""
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 
 from codex_deepseek_team import sandbox
@@ -25,6 +26,16 @@ class FakeRunner:
         if args[0] == '/usr/bin/aa-exec':
             return subprocess.CompletedProcess(args, self.apparmor, '', 'apparmor blocked' if self.apparmor else '')
         return subprocess.CompletedProcess(args, self.direct, '', 'direct blocked' if self.direct else '')
+
+
+class RecordingRunner:
+    def __init__(self, returncode=0):
+        self.returncode = returncode
+        self.calls = []
+
+    def __call__(self, args, **kwargs):
+        self.calls.append(list(args))
+        return subprocess.CompletedProcess(args, self.returncode, '', '')
 
 
 def fake_which(with_aa=True):
@@ -150,6 +161,116 @@ class CommandLayoutTests(unittest.TestCase):
         self.assertLess(runtime_index, keyring_index)
         self.assertLess(runtime_index, ssh_index)
         self.assertLess(runtime_index, netrc_index)
+
+    def test_refuses_to_mount_entire_real_home_as_checkout(self):
+        with self.assertRaises(sandbox.SandboxError) as caught:
+            sandbox.wrap_command(['/usr/bin/claude'], cwd=Path('/home/alice'),
+                                 session_home=Path('/tmp/session'), writable=False,
+                                 env={'HOME': '/tmp/session', 'PATH': '/usr/bin'},
+                                 backend=self.backend(), real_home=Path('/home/alice'))
+        self.assertEqual(caught.exception.code, 78)
+
+
+class CodexWrapperTests(unittest.TestCase):
+    def test_direct_backend_creates_private_bwrap_shim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            backend = sandbox.SandboxBackend(('/usr/bin/bwrap',), '/usr/bin/bwrap', 'direct')
+            env = sandbox.prepare_codex_environment(home, {'PATH': '/usr/bin:/bin'}, backend)
+            wrapper = Path(env['PATH'].split(':', 1)[0]) / 'bwrap'
+            self.assertTrue(wrapper.is_file())
+            self.assertEqual(wrapper.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(wrapper.parent.stat().st_mode & 0o777, 0o700)
+            self.assertIn("exec /usr/bin/bwrap \"$@\"", wrapper.read_text())
+
+    def test_apparmor_backend_shim_selects_named_profile_without_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            backend = sandbox.SandboxBackend(
+                ('/usr/bin/aa-exec', '-p', sandbox.PROFILE_NAME, '--', '/usr/bin/bwrap'),
+                '/usr/bin/bwrap', 'apparmor')
+            env = sandbox.prepare_codex_environment(
+                home, {'PATH': '/usr/bin', 'DEEPSEEK_API_KEY': 'DO_NOT_COPY_TO_SCRIPT'}, backend)
+            wrapper = Path(env['PATH'].split(':', 1)[0]) / 'bwrap'
+            text = wrapper.read_text()
+            self.assertIn('aa-exec', text)
+            self.assertIn(sandbox.PROFILE_NAME, text)
+            self.assertIn('/usr/bin/bwrap', text)
+            self.assertNotIn('DO_NOT_COPY_TO_SCRIPT', text)
+
+
+class AppArmorLifecycleTests(unittest.TestCase):
+    def test_profile_bytes_are_named_unconfined_userns_policy(self):
+        text = sandbox.profile_bytes().decode()
+        self.assertIn('profile deepseek-team-bwrap flags=(unconfined)', text)
+        self.assertIn('userns,', text)
+        self.assertNotIn('/usr/bin/bwrap', text)
+
+    def test_install_refuses_foreign_existing_profile_without_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / sandbox.PROFILE_NAME
+            target.write_text('administrator policy\n')
+            runner = RecordingRunner()
+            with self.assertRaises(sandbox.SandboxError) as caught:
+                sandbox.install_apparmor(use_sudo=False, runner=runner, target=target)
+            self.assertEqual(caught.exception.code, 78)
+            self.assertEqual(runner.calls, [])
+            self.assertEqual(target.read_text(), 'administrator policy\n')
+
+    def test_install_existing_exact_profile_only_reloads_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / sandbox.PROFILE_NAME
+            target.write_bytes(sandbox.profile_bytes())
+            runner = RecordingRunner()
+            changed = sandbox.install_apparmor(use_sudo=False, runner=runner, target=target)
+            self.assertFalse(changed)
+            self.assertEqual(len(runner.calls), 1)
+            self.assertIn('-r', runner.calls[0])
+            self.assertEqual(runner.calls[0][-1], str(target))
+
+    def test_install_absent_profile_uses_root_owned_0644_copy_then_parser(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / sandbox.PROFILE_NAME
+            runner = RecordingRunner()
+            changed = sandbox.install_apparmor(use_sudo=False, runner=runner, target=target)
+            self.assertTrue(changed)
+            self.assertEqual(len(runner.calls), 2)
+            install, parser = runner.calls
+            self.assertEqual(install[0], 'install')
+            self.assertIn('0644', install)
+            self.assertEqual(install[-1], str(target))
+            self.assertIn('-r', parser)
+            self.assertEqual(parser[-1], str(target))
+
+    def test_remove_refuses_modified_or_symlink_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / sandbox.PROFILE_NAME
+            runner = RecordingRunner()
+            target.write_text('modified')
+            with self.assertRaises(sandbox.SandboxError):
+                sandbox.remove_apparmor(use_sudo=False, runner=runner, target=target)
+            self.assertEqual(runner.calls, [])
+            target.unlink()
+            foreign = root / 'foreign'
+            foreign.write_bytes(sandbox.profile_bytes())
+            target.symlink_to(foreign)
+            with self.assertRaises(sandbox.SandboxError):
+                sandbox.remove_apparmor(use_sudo=False, runner=runner, target=target)
+            self.assertEqual(runner.calls, [])
+
+    def test_remove_exact_profile_unloads_before_deleting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / sandbox.PROFILE_NAME
+            target.write_bytes(sandbox.profile_bytes())
+            runner = RecordingRunner()
+            removed = sandbox.remove_apparmor(use_sudo=False, runner=runner, target=target)
+            self.assertTrue(removed)
+            self.assertEqual(len(runner.calls), 2)
+            self.assertIn('-R', runner.calls[0])
+            self.assertEqual(runner.calls[0][-1], str(target))
+            self.assertEqual(runner.calls[1][:3], ['rm', '-f', '--'])
+            self.assertEqual(runner.calls[1][-1], str(target))
 
 
 if __name__ == '__main__':
