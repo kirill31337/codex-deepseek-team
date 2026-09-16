@@ -128,7 +128,9 @@ def prepare_codex_environment(session_home: Path, env: dict[str, str],
     Codex itself creates the Bubblewrap namespace. Nesting Codex inside another
     user namespace would break that native sandbox on current Linux builds, so we
     put a private `bwrap` shim first on PATH instead. On Ubuntu-restricted hosts
-    the shim applies the package named AppArmor profile with aa-exec.
+    the shim applies the package named AppArmor profile with aa-exec. The shim
+    also injects ``--disable-userns`` once, preventing payload processes from
+    creating additional user namespaces after Codex establishes its sandbox.
     """
     session_home = Path(session_home)
     wrapper_dir = session_home / '.deepseek-team-bwrap-bin'
@@ -136,7 +138,15 @@ def prepare_codex_environment(session_home: Path, env: dict[str, str],
     try:
         wrapper_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
         command = ' '.join(shlex.quote(part) for part in backend.prefix)
-        payload = '#!/bin/sh\nexec ' + command + ' "$@"\n'
+        payload = (
+            '#!/bin/sh\n'
+            'for arg do\n'
+            '  if [ "$arg" = "--disable-userns" ]; then\n'
+            '    exec ' + command + ' "$@"\n'
+            '  fi\n'
+            'done\n'
+            'exec ' + command + ' --disable-userns "$@"\n'
+        )
         fd = os.open(wrapper, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
         with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as target:
             target.write(payload)
