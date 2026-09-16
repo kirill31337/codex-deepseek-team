@@ -41,6 +41,9 @@ def main(argv=None):
         print('This release supports Linux with Python 3.11+ and Codex and/or Claude Code.', file=sys.stderr)
         return 78
     from . import config, doctor, sandbox, worker
+    if argv and argv[0] in ('config', 'workspace'):
+        from . import delegation_cli
+        return delegation_cli.main(argv)
     if argv and argv[0] == 'worker':
         original = sys.argv
         try:
@@ -76,6 +79,8 @@ def main(argv=None):
     sandbox_commands.add_parser('status', help='Probe Bubblewrap and the effective AppArmor/userns backend.')
     sandbox_commands.add_parser('install-apparmor', help='Install/reload only the package-owned named AppArmor profile.')
     sandbox_commands.add_parser('remove-apparmor', help='Remove only an unchanged package-owned AppArmor profile.')
+    commands.add_parser('config', help='Manage delegation profiles; use config --help.')
+    commands.add_parser('workspace', help='Prepare and inspect owned development copies; use workspace --help.')
     commands.add_parser('doctor', help='Check local setup; use doctor --help for runtime/live options.')
     commands.add_parser('worker', help='Run a worker; use worker --help for runtime/read/write options.')
     args = parser.parse_args(argv)

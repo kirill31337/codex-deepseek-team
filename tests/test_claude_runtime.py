@@ -34,7 +34,8 @@ record = {
     'effort': os.environ.get('CLAUDE_CODE_EFFORT_LEVEL'),
     'compact_window': os.environ.get('CLAUDE_CODE_AUTO_COMPACT_WINDOW'),
     'auth_digest': hashlib.sha256(os.environ.get('ANTHROPIC_AUTH_TOKEN', '').encode()).hexdigest(),
-    'parent_api_key': 'ANTHROPIC_API_KEY' in os.environ,
+    'parent_api_key': os.environ.get('ANTHROPIC_API_KEY') == 'parent-anthropic-secret',
+    'api_key_digest': hashlib.sha256(os.environ.get('ANTHROPIC_API_KEY', '').encode()).hexdigest(),
     'parent_oauth': 'CLAUDE_CODE_OAUTH_TOKEN' in os.environ,
     'deepseek_key': 'DEEPSEEK_API_KEY' in os.environ,
 }
@@ -103,6 +104,7 @@ class ClaudeRuntimeTests(unittest.TestCase):
         self.assertEqual(call['compact_window'], '786432')
         self.assertEqual(call['auth_digest'], hashlib.sha256(self.key.encode()).hexdigest())
         self.assertFalse(call['parent_api_key'])
+        self.assertEqual(call['api_key_digest'], hashlib.sha256(self.key.encode()).hexdigest())
         self.assertFalse(call['parent_oauth'])
         self.assertFalse(call['deepseek_key'])
         self.assertEqual(call['cwd'], str(self.repo))

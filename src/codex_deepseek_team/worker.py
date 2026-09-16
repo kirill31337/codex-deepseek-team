@@ -176,6 +176,9 @@ def child_environment(home, key, runtime='codex'):
         env.update(
             ANTHROPIC_BASE_URL=CLAUDE_BASE_URL,
             ANTHROPIC_AUTH_TOKEN=key,
+            ANTHROPIC_API_KEY=key,
+            CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1',
+            DISABLE_AUTOUPDATER='1',
             ANTHROPIC_MODEL=CLAUDE_MODEL,
             ANTHROPIC_DEFAULT_OPUS_MODEL=CLAUDE_MODEL,
             ANTHROPIC_DEFAULT_SONNET_MODEL=CLAUDE_MODEL,
@@ -405,9 +408,35 @@ def runtime_result(runtime, raw):
     raise WorkerError(64, f'Unsupported worker runtime: {runtime}.')
 
 
+def _worker_api():
+    from types import SimpleNamespace
+    return SimpleNamespace(**globals())
+
+
 def run(args):
     if os.environ.get('DEEPSEEK_TEAM_DISABLED') == '1' or os.environ.get('CODEX_DEEPSEEK_DISABLED') == '1':
         raise WorkerError(69, 'DeepSeek delegation disabled; the coordinator should continue locally.')
+    # Support direct execution and legacy standalone read-only deployments.
+    sibling = Path(__file__).resolve().with_name('settings.py')
+    if sibling.exists():
+        package_parent = str(sibling.parent.parent)
+        if package_parent not in sys.path:
+            sys.path.insert(0, package_parent)
+        from codex_deepseek_team import settings, workspace, managed
+        try:
+            copy = workspace.load(args.state_dir, args.workspace) if getattr(args, 'workspace', None) else None
+            root = settings.project_root(copy.source if copy else Path.cwd())
+            policy = settings.resolve(root, delegation_level=getattr(args, 'delegation_level', None),
+                                      access=getattr(args, 'access', None))
+        except (settings.SettingsError, workspace.WorkspaceError) as error:
+            raise WorkerError(getattr(error, 'code', 78), str(error)) from None
+        print(settings.describe(policy), file=sys.stderr)
+        if args.write:
+            print('Actual access: legacy exact-file writer (source: CLI --write --allow-write).', file=sys.stderr)
+        elif policy.effective_access == 'full-access' or copy is not None:
+            return managed.run(args, policy, sys.modules.get(__name__) or _worker_api(), copy)
+    elif any(getattr(args, name, None) for name in ('delegation_level', 'access', 'workspace')):
+        raise WorkerError(78, 'Delegation configuration support is unavailable; reinstall DeepSeek Team.')
     if not args.write:
         return run_worker(args, None)
     try:
@@ -497,6 +526,10 @@ def parse_args():
                         help='0: wait without a total deadline (default); 1..900: explicit total limit in seconds, including retries.')
     parser.add_argument('--attempts', type=int, choices=[1, 2, 3],
                         help='Read-only: 2 by default. Writer: exactly 1, never retry partial edits.')
+    parser.add_argument('--delegation-level', type=int, choices=[25, 50, 75])
+    parser.add_argument('--access', choices=['auto', 'read-only', 'full-access'])
+    parser.add_argument('--workspace', help='Reuse an owned workspace ID; never adopts foreign directories.')
+    parser.add_argument('--resume-after-failure', action='store_true', help='Explicit continuation after inspecting partial work.')
     parser.add_argument('--write', action='store_true', help='Opt in to writing in a clean linked worktree on a codex/ or deepseek/ branch.')
     parser.add_argument('--allow-write', action='append', default=[], metavar='FILE',
                         help='Exact repository-relative source file allowed to change; repeat for each file.')
@@ -506,6 +539,15 @@ def parse_args():
                         default=Path.home() / '.local/state/codex-deepseek',
                         help='Shared lock directory; keep the same directory for all workers.')
     args = parser.parse_args()
+    args.attempts_explicit = args.attempts is not None
+    if args.write and (args.access is not None or args.workspace):
+        parser.error('--write --allow-write cannot be combined with --access or --workspace')
+    if args.resume_after_failure and not args.workspace:
+        parser.error('--resume-after-failure requires an owned --workspace ID')
+    if args.access == 'full-access' and args.os_sandbox == 'off':
+        parser.error('full-access requires the OS sandbox; --os-sandbox off is incompatible')
+    if args.access == 'full-access' and args.attempts not in (None, 1):
+        parser.error('full-access never retries automatically; --attempts must be 1')
     if args.write != bool(args.allow_write):
         parser.error('--write requires --allow-write files; --allow-write requires --write')
     if args.write and args.attempts not in [None, 1]:

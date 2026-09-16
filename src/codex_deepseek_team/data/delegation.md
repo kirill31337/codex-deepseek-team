@@ -1,14 +1,35 @@
-## Delegating to DeepSeek workers
+## DeepSeek delegation
 
-- The coordinator owns architecture, security decisions, final diff review, tests and integration.
-- Delegate bounded work when its result replaces coordinator work: focused research, review, tests, boilerplate or local implementation. Keep tiny tasks local when delegation would cost more.
-- Give each worker a concrete question or acceptance criteria, only necessary files, and a short expected result. Never pass secrets, personal data, host configuration or the full conversation.
-- Wait for the full worker result before investigating its assigned area. While it runs, do independent work; afterwards verify its evidence and diff without repeating the entire investigation or rewriting correct code.
-- Workers are read-only by default.
-- The Linux OS sandbox is required by default. Never add `--os-sandbox off` to managed worker calls. If `deepseek-team sandbox status` fails, fix Bubblewrap/AppArmor setup or continue the task locally instead of weakening containment.
-- `--write` requires a clean, dedicated `codex/` or `deepseek/` linked worktree and an exact `--allow-write` file list.
-- A writer has one owner per file and one attempt; read-only workers may use bounded retries on actual failures. Workers must not stage, commit, push, deploy, or run builds/tests. The coordinator runs checks.
-- Run at most three independent workers sharing the same locks, and do not impose an overall worker timeout. Wait in intervals of up to 60 seconds; silence alone is not a failure and does not authorize duplicate work or cancellation.
-- Fall back to coordinator work after a completed runner error, unavailable credentials/runner/sandbox, or `DEEPSEEK_TEAM_DISABLED=1` (`CODEX_DEEPSEEK_DISABLED=1` remains supported); do not repeatedly call a broken provider.
-- Review the actual diff, including new files; workers return a short summary instead of copied code.
-- Run a worker with: `deepseek-team worker --runtime {runtime}` (the legacy `codex-deepseek-team` command is equivalent).
+Before each new assignment, obtain the CURRENT effective profile, actual access
+and value sources (do not rely on a cached level in this file):
+
+```bash
+deepseek-team config show --effective --instructions --runtime {runtime}
+```
+
+Global/project settings affect new jobs only. The worker enforces the resolved
+access at launch and reports it before credential access. Access is independent
+of the target delegation level; explicit read-only always remains read-only.
+
+Keep the Linux OS sandbox enabled. Never add `--os-sandbox off` to ordinary worker
+commands and never globally disable Ubuntu AppArmor restrictions.
+
+Use `deepseek-team worker --runtime {runtime}` with a bounded goal, acceptance
+criteria and enough context. Read-only jobs investigate/review without writes.
+Full-access jobs automatically receive their own development copy and may edit
+any project files and run prepared local tests/builds. The coordinator prepares
+missing dependencies with `workspace create` / `workspace prepare`; do not ask the
+user to manually prepare the working copy or enumerate every file.
+
+Existing source dirty/untracked/ignored files are not automatically copied or
+cleaned. Review the baseline and explicitly prepare needed source context in the
+owned copy. Reuse only an owned `--workspace ID`; inspect partial output before
+`--resume-after-failure`. Never retry an uncertain implementation automatically.
+
+The legacy `--write --allow-write FILE` remains available for exact-file changes
+in a clean linked worktree. Only that narrow mode forbids tests/builds and requires
+an explicit list. Do not combine its flags with the new access flags.
+
+No worker stages, commits, pushes, deploys or publishes. Production databases,
+secrets and host services remain coordinator-only. Wait without an overall timeout
+unless explicitly requested; silence is not failure. At most three workers may run.

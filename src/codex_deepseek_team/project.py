@@ -24,17 +24,23 @@ class ProjectError(Exception):
     """Raised for an invalid or ambiguous target; existing content is untouched."""
 
 
-def _guidance(runtime='codex'):
+def _guidance(runtime='codex', root=None):
     try:
         body = DATA_FILE.read_bytes()
     except OSError as error:
         raise ProjectError("packaged delegation guidance is unavailable") from error
-    return body.replace(b'{runtime}', runtime.encode('ascii')).strip(b"\n")
+    from . import settings
+    try:
+        policy = settings.resolve(root)
+    except settings.SettingsError as error:
+        raise ProjectError(str(error)) from None
+    dynamic = settings.instructions(policy, runtime).encode('utf-8')
+    return body.replace(b'{runtime}', runtime.encode('ascii')).strip(b"\n") + b'\n\n' + dynamic
 
 
-def _block_bytes(state, runtime='codex'):
+def _block_bytes(state, runtime='codex', root=None):
     metadata = b"<!-- codex-deepseek-team:original:" + state + b" -->\n"
-    return START_MARKER + b"\n" + metadata + _guidance(runtime) + b"\n" + END_MARKER + b"\n"
+    return START_MARKER + b"\n" + metadata + _guidance(runtime, root) + b"\n" + END_MARKER + b"\n"
 
 
 def _repository_root(root):
@@ -147,12 +153,12 @@ def _prepare_attach(repository, runtime):
     marks = _locate(content)
     if marks is None:
         state = b"created" if original is None else (b"existing-content" if original else b"existing-empty")
-        block = _block_bytes(state, runtime)
+        block = _block_bytes(state, runtime, repository)
         updated = content + (b"\n" if content else b"") + block
     else:
         begin, finish = marks
         state = _original_state(content, begin)
-        block = _block_bytes(state, runtime)
+        block = _block_bytes(state, runtime, repository)
         updated = content[:begin] + block + content[_owned_span(content, begin, finish, state)[1]:]
     return target, original, mode, updated
 
