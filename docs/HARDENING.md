@@ -20,11 +20,13 @@ The profile is intentionally unconfined for ordinary resources and grants `usern
 
 Current Codex on Linux already builds its own Bubblewrap sandbox. DeepSeek Team therefore does not put Codex inside a second user namespace. It probes a working direct/AppArmor-aware `bwrap` backend, creates a private temporary `bwrap` shim and places it first on the worker `PATH`. Codex then constructs its normal `read-only` / `workspace-write` sandbox through that verified executable.
 
-The shim contains only the executable/profile prefix; provider credentials remain in the sanitized child environment and are never written into the script or argv.
+Because the AppArmor profile grants permission to create the **initial** user namespace, the private shim also guarantees Bubblewrap `--disable-userns` exactly once. If Codex already supplies the flag it is preserved without duplication; otherwise the shim injects it. This prevents processes inside the completed Codex sandbox from using the inherited AppArmor `userns` permission to create further user namespaces.
+
+The shim contains only the executable/profile prefix and this fixed hardening rule; provider credentials remain in the sanitized child environment and are never written into the script or argv.
 
 ### Claude Code: outer Bubblewrap
 
-The isolated Claude worker harness runs inside an outer Bubblewrap namespace. The policy uses a read-only root, fresh user/PID/IPC/UTS namespaces, dropped capabilities, private temporary directories, a temporary writable worker HOME, and a worktree mounted read-only for review or read-write for writer mode. The real user HOME is hidden and only runtime roots needed to start the CLI are re-exposed read-only; common credential locations are then masked again.
+The isolated Claude worker harness runs inside an outer Bubblewrap namespace. The policy uses a read-only root, fresh user/PID/IPC/UTS namespaces, dropped capabilities, private temporary directories, a temporary writable worker HOME, and a worktree mounted read-only for review or read-write for writer mode. The real user HOME is hidden and only runtime roots needed to start the CLI are re-exposed read-only; common credential locations are then masked again. The outer sandbox passes `--disable-userns`, so the Claude payload cannot create another user namespace after setup.
 
 The outer Claude policy intentionally keeps the host network namespace because the CLI must reach the DeepSeek API. This feature does not claim network isolation. Claude still exposes no Bash/web/agent tools to the worker and explicitly denies MCP tools.
 
