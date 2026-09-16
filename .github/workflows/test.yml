@@ -34,7 +34,7 @@ jobs:
       - name: Install DeepSeek Team
         run: python -m pip install .
       - name: Compile packaged AppArmor profile
-        run: apparmor_parser -Q src/codex_deepseek_team/data/apparmor/deepseek-team-bwrap
+        run: apparmor_parser -Q -K src/codex_deepseek_team/data/apparmor/deepseek-team-bwrap
       - name: Attempt live AppArmor and Bubblewrap probe
         shell: bash
         run: |
