@@ -85,10 +85,15 @@ class CommandLayoutTests(unittest.TestCase):
             'PATH': '/home/alice/.local/bin:/usr/bin:/bin',
             'ANTHROPIC_AUTH_TOKEN': 'SECRET_VALUE_MUST_NOT_APPEAR_IN_ARGV',
         }
+        existing_paths = {
+            '/home/alice', '/home/alice/.local', str(session), str(cwd), '/var/tmp',
+        }
         args = sandbox.wrap_command(
             ['/home/alice/.local/bin/claude', '--bare'], cwd=cwd,
             session_home=session, writable=False, env=env,
-            backend=self.backend(), real_home=Path('/home/alice'))
+            backend=self.backend(), real_home=Path('/home/alice'),
+            existing=lambda path: str(path) in existing_paths,
+            is_dir=lambda _path: True)
         joined = '\0'.join(args)
         for flag in ['--die-with-parent', '--new-session', '--unshare-user',
                      '--unshare-pid', '--unshare-ipc', '--unshare-uts',
@@ -130,7 +135,7 @@ class CommandLayoutTests(unittest.TestCase):
             writable=False, env={'HOME': str(session), 'PATH': '/home/alice/.local/bin:/usr/bin'},
             backend=self.backend(), real_home=Path('/home/alice'),
             existing=lambda path: str(path) in {
-                '/home/alice/.local', '/home/alice/.local/share/keyrings',
+                '/home/alice', '/home/alice/.local', '/home/alice/.local/share/keyrings',
                 '/home/alice/.ssh', '/home/alice/.netrc', str(cwd), str(session),
             },
             is_dir=lambda path: str(path) != '/home/alice/.netrc')
