@@ -21,12 +21,26 @@ def _runtimes(value):
     raise ValueError('runtime must be codex, claude, both or auto')
 
 
+def _sandbox_status(sandbox):
+    backend = sandbox.probe_backend()
+    restriction = sandbox.apparmor_restriction()
+    print(f'Bubblewrap: {backend.bwrap}')
+    print(f'OS sandbox backend: {backend.source}')
+    if restriction is None:
+        print('kernel.apparmor_restrict_unprivileged_userns: unavailable')
+    else:
+        print(f'kernel.apparmor_restrict_unprivileged_userns={restriction}')
+    if backend.source == 'apparmor':
+        print(f'AppArmor profile: {sandbox.PROFILE_NAME} (selected with aa-exec)')
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if sys.platform != 'linux':
         print('This release supports Linux with Python 3.11+ and Codex and/or Claude Code.', file=sys.stderr)
         return 78
-    from . import config, doctor, worker
+    from . import config, doctor, sandbox, worker
     if argv and argv[0] == 'worker':
         original = sys.argv
         try:
@@ -57,6 +71,11 @@ def main(argv=None):
     setter.add_argument('--stdin', action='store_true', help='Read from a pipe; never pass a key as a command argument.')
     auth_commands.add_parser('status', help='Report whether a usable key is present, without displaying it.')
     auth_commands.add_parser('remove', help='Delete the saved key; environment overrides are unaffected.')
+    sandbox_cmd = commands.add_parser('sandbox', help='Inspect or manage Linux Bubblewrap/AppArmor isolation.')
+    sandbox_commands = sandbox_cmd.add_subparsers(dest='sandbox_command', required=True)
+    sandbox_commands.add_parser('status', help='Probe Bubblewrap and the effective AppArmor/userns backend.')
+    sandbox_commands.add_parser('install-apparmor', help='Install/reload only the package-owned named AppArmor profile.')
+    sandbox_commands.add_parser('remove-apparmor', help='Remove only an unchanged package-owned AppArmor profile.')
     commands.add_parser('doctor', help='Check local setup; use doctor --help for runtime/live options.')
     commands.add_parser('worker', help='Run a worker; use worker --help for runtime/read/write options.')
     args = parser.parse_args(argv)
@@ -104,10 +123,24 @@ def main(argv=None):
                 present = bool(worker.load_api_key().strip())
                 print('Key available; value omitted.' if present else 'No key configured.')
                 return 0 if present else 78
+        elif args.command == 'sandbox':
+            if args.sandbox_command == 'status':
+                return _sandbox_status(sandbox)
+            if args.sandbox_command == 'install-apparmor':
+                changed = sandbox.install_apparmor()
+                print('DeepSeek Team AppArmor profile installed and loaded.' if changed
+                      else 'DeepSeek Team AppArmor profile already matched and was reloaded.')
+            else:
+                changed = sandbox.remove_apparmor()
+                print('DeepSeek Team AppArmor profile unloaded and removed.' if changed
+                      else 'No package-owned AppArmor profile was present.')
         return 0
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 78
+    except sandbox.SandboxError as error:
+        print(error.message, file=sys.stderr)
+        return error.code
     except (config.ConfigError, worker.WorkerError) as error:
         print(error.message if isinstance(error, worker.WorkerError) else str(error), file=sys.stderr)
         return error.code if isinstance(error, worker.WorkerError) else 78
