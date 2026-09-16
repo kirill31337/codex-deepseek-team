@@ -37,7 +37,7 @@ class CliTests(unittest.TestCase):
         r = self.cli('setup', '--no-key')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(tomllib.loads(path.read_text())['model'], 'another-coordinator')
-        r = self.cli('doctor', '--offline')
+        r = self.cli('doctor', '--offline', '--os-sandbox', 'off')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('another-coordinator', r.stdout)
         self.assertEqual(self.cli('reset').returncode, 0)
