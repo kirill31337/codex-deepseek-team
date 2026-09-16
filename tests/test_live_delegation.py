@@ -260,8 +260,15 @@ class InstalledRuntimeTests(LiveBase):
                              'usage':{'input_tokens':10,'output_tokens':10}}
                     if body.get('stream'):
                         initial=dict(message,content=[],stop_reason=None)
+                        if block['type'] == 'tool_use':
+                            start_block = dict(block, input={})
+                            delta = {'type': 'input_json_delta', 'partial_json': json.dumps(block['input'])}
+                        else:
+                            start_block = dict(block, text='')
+                            delta = {'type': 'text_delta', 'text': block['text']}
                         events=[('message_start',{'message':initial}),
-                                ('content_block_start',{'index':0,'content_block':block}),
+                                ('content_block_start',{'index':0,'content_block':start_block}),
+                                ('content_block_delta',{'index':0,'delta':delta}),
                                 ('content_block_stop',{'index':0}),
                                 ('message_delta',{'delta':{'stop_reason':stop,'stop_sequence':None},'usage':{'output_tokens':10}}),
                                 ('message_stop',{})]
@@ -276,12 +283,18 @@ class InstalledRuntimeTests(LiveBase):
         original_relay=relay.ProviderRelay
         factory=lambda path,key: original_relay(path,key,upstream=('http','127.0.0.1',server.server_port))
         out,err=io.StringIO(),io.StringIO()
+        raw_results=[]
+        execute=worker.execute
+        def capture(*args):
+            result=execute(*args)
+            raw_results.append(result)
+            return result
         try:
             args=self.args('Exercise the provided file operation, then report.',runtime=runtime,
                            codex=binary if runtime=='codex' else 'codex',claude=binary if runtime=='claude' else 'claude',timeout=60)
-            with patch.object(relay,'ProviderRelay',side_effect=factory),redirect_stdout(out),redirect_stderr(err):
+            with patch.object(relay,'ProviderRelay',side_effect=factory), patch.object(worker,'execute',side_effect=capture), redirect_stdout(out),redirect_stderr(err):
                 code=managed.run(args,self.policy(50 if writable else 25),worker,copy)
-            self.assertEqual(code,0,err.getvalue())
+            self.assertEqual(code,0,err.getvalue() + repr(raw_results))
             self.assertIn('RUNTIME_FIXTURE_DONE',out.getvalue())
             self.assertGreaterEqual(len(calls),2,'No actual runtime tool roundtrip: '+err.getvalue())
             self.assertTrue(all(c['auth'] for c in calls))

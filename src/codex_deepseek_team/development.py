@@ -133,14 +133,16 @@ def layout(backend: sandbox.SandboxBackend, work: Path, home: Path, control: Pat
         path = Path(name)
         if path.exists():
             args += ['--ro-bind', str(path.resolve()), name]
+    # Create private mount parents first; otherwise a later tmpfs hides a CLI
+    # installed below /tmp along with any earlier read-only runtime mounts.
+    args += ['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+             '--dir', '/var', '--tmpfs', '/var/tmp', '--dir', '/run']
     for root in runtime_roots(executables):
         if root.is_symlink():
             args += ['--symlink', os.readlink(root), str(root)]
         elif root.exists():
             args += ['--ro-bind', str(root), str(root)]
-    args += ['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
-             '--dir', '/var', '--tmpfs', '/var/tmp', '--dir', '/run',
-             '--bind', str(home), str(home),
+    args += ['--bind', str(home), str(home),
              '--bind' if writable else '--ro-bind', str(work), str(work),
              '--ro-bind', str(work / '.git'), str(work / '.git'),
              '--ro-bind', str(control), '/run/deepseek-team', '--chdir', str(work)]
