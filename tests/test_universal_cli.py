@@ -71,7 +71,7 @@ class UniversalCliTests(unittest.TestCase):
         self.assertFalse((repo / 'CLAUDE.md').exists())
 
     def test_claude_offline_doctor_never_requires_codex_config(self):
-        result = self.cli('doctor', '--runtime', 'claude', '--offline')
+        result = self.cli('doctor', '--runtime', 'claude', '--offline', '--os-sandbox', 'off')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('claude-code-test', result.stdout)
         self.assertFalse((self.home / 'codex/config.toml').exists())
@@ -79,7 +79,7 @@ class UniversalCliTests(unittest.TestCase):
     def test_claude_doctor_requires_disallowed_tools_support(self):
         self.claude.write_text('#!/bin/sh\ncase "$1" in\n--version) echo claude-code-old;;\n--help) echo "--bare --print --output-format --no-session-persistence --permission-mode --tools --allowedTools";;\nesac\n')
         self.claude.chmod(0o755)
-        result = self.cli('doctor', '--runtime', 'claude', '--offline')
+        result = self.cli('doctor', '--runtime', 'claude', '--offline', '--os-sandbox', 'off')
         self.assertEqual(result.returncode, 78, result.stdout + result.stderr)
         self.assertIn('required', result.stderr.lower())
 
