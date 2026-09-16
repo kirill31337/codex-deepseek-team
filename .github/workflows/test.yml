@@ -19,3 +19,48 @@ jobs:
       - run: python -m pip install dist/*.whl
       - run: codex-deepseek-team --version
       - run: deepseek-team --version
+
+  sandbox-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install system sandbox tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap apparmor
+      - name: Install DeepSeek Team
+        run: python -m pip install .
+      - name: Compile packaged AppArmor profile
+        run: apparmor_parser -Q src/codex_deepseek_team/data/apparmor/deepseek-team-bwrap
+      - name: Attempt live AppArmor and Bubblewrap probe
+        shell: bash
+        run: |
+          set -u
+          profile_loaded=0
+          if deepseek-team sandbox install-apparmor; then
+            profile_loaded=1
+          else
+            echo '::notice::Hosted runner could not load the AppArmor profile; syntax compilation already passed. This host is not evidence of live AppArmor enforcement.'
+          fi
+
+          if deepseek-team sandbox status; then
+            echo 'Bubblewrap backend probe: PASS'
+          else
+            echo '::notice::Hosted runner kernel/userns policy does not permit the live Bubblewrap probe. Deterministic unit tests remain the release gate.'
+          fi
+
+          if [ "$profile_loaded" -eq 1 ]; then
+            if aa-exec -p deepseek-team-bwrap -- bwrap \
+              --die-with-parent --new-session \
+              --unshare-user --unshare-pid --unshare-ipc --unshare-uts \
+              --disable-userns --cap-drop ALL \
+              --ro-bind / / --proc /proc --dev /dev \
+              -- /usr/bin/true; then
+              echo 'Named AppArmor profile + Bubblewrap userns probe: PASS'
+            else
+              echo '::notice::Named profile loaded but hosted runner kernel did not permit the live userns probe.'
+            fi
+          fi
