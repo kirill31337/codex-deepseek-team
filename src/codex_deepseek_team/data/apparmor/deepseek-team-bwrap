@@ -1,0 +1,10 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# Selected explicitly with aa-exec. Bubblewrap provides the actual filesystem
+# and process isolation; this profile only permits creation of the initial
+# unprivileged user namespace on Ubuntu's restricted-userns systems.
+profile deepseek-team-bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/deepseek-team-bwrap>
+}
